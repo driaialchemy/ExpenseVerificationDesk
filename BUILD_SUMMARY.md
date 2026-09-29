@@ -1,8 +1,8 @@
 # Expense Verification Pipeline - Build Summary
 
-## ✓ Build Complete
+## Prototype status
 
-All components of the expense-verification-pipeline have been successfully built and tested.
+The pipeline, decision log, and dashboard view are implemented and covered by local tests. This is not a production certification, and the tests are not an accuracy measurement.
 
 ### Repository Structure
 
@@ -43,15 +43,7 @@ expense-verification-pipeline/
 
 ### Test Results
 
-✓ **31 tests passing** (100% success rate)
-
-- Ingestion tests: 4/4 passing
-- Policy parser tests: 4/4 passing
-- Checker tests: 4/4 passing
-- Verifier tests: 6/6 passing
-- Gates tests: 4/4 passing
-- Snowflake loader tests: 6/6 passing
-- End-to-end tests: 3/3 passing
+Local `pytest` covers ingestion, policy parsing, the checker (including the configured model id), the verifier, gates, the Snowflake loader with mocks, end-to-end temp files, the decision log, OpenAI logprob handling with a fake client, and dashboard retrieval. Re-run `pytest tests/ -q` for the current count. No live model or Snowflake call is part of that suite.
 
 ### Verified Features
 
@@ -78,6 +70,8 @@ expense-verification-pipeline/
 - [x] Department breakdown charts
 - [x] Category breakdown charts
 - [x] Needs-review callout section
+- [x] View decision process reads the local decision log and does not call a model
+- [x] Incomplete and legacy records are labeled
 - [x] SQL query abstraction layer
 
 #### CLI
@@ -86,12 +80,33 @@ expense-verification-pipeline/
 - [x] CSV report output
 - [x] Stage-by-stage logging
 
+#### Decision log
+- [x] Versioned SQLite record per expense: ids, timestamps, source row, input and policy snapshots, applied clauses, model-stated output, verifier checks, disagreement, reconciliation rule, errors, and retries
+- [x] Append-only events; a later recorded human review keeps the earlier version
+- [x] Mandatory audit-write failure blocks finalization and Snowflake loading
+- [x] CSV export keeps the original columns and appends reasons plus the reconciliation rule
+- [x] `audit/`, `reports/`, and SQLite files are gitignored
+
+#### OpenAI observation mode
+- [x] Anthropic remains the default checker
+- [x] OpenAI mode classifies with the labels `approved` and `flagged`, then requests a separate explanation
+- [x] Label-token logprobs are stored only for that model and converted with `exp(logprob)`
+- [x] Invalid labels, refusals, and missing scores are explicit; missing probabilities stay null
+- [x] Probabilities do not change the approver
+
+#### Daily limit
+- [x] Same employee, calendar day, category, and currency are summed
+- [x] Different currencies are not converted or added together
+- [x] Receipt and manager-approval checks stay per line
+- [x] Applied clauses are cited on pass and fail
+
 #### Safety & Design
 - [x] No secrets in git (.env gitignored)
 - [x] Verifier is pure code (no LLM/network)
 - [x] Gates check artifacts, not status flags
 - [x] Snowflake writes are additive (tagged by run_id)
-- [x] Comprehensive error handling
+- [x] Model id from `--model` or `ANTHROPIC_MODEL` is sent to the checker
+- [x] Audit write failures are raised instead of printed and ignored
 
 ### Real Data Tested
 
@@ -135,11 +150,11 @@ streamlit run src/expense_pipeline/dashboard/app.py
 
 ## What Was Built
 
-This is a production-ready, gated expense verification pipeline that demonstrates:
-- Multi-stage data processing with independent verification
-- Gate-based quality assurance (artifacts, not status strings)
-- Comprehensive audit trails
-- Dual-mode dashboard (Streamlit + Snowflake-native)
-- Extensible CLI with clear separation of concerns
+This prototype demonstrates:
+- Multi-stage expense checks with an independent verifier
+- Gate checks on artifacts
+- A versioned local decision log
+- A dashboard that can show the stored decision process
+- An optional OpenAI label-probability mode that does not change approvals
 
-The codebase is ready for deployment and further integration with production systems.
+It is not a claim that the prototype is ready for production, and it is not a measurement of how often the verdicts would match a human reviewer.

@@ -18,6 +18,7 @@ class Expense:
     currency: str
     receipt_attached: bool
     notes: Optional[str] = None
+    source_row: Optional[int] = None
 
 
 @dataclass
@@ -55,6 +56,7 @@ class ExpenseVerdict:
     verdict: str  # "approved" | "flagged"
     reasons: list[str]
     rule_citations: list[str]
+    checks: Optional[list] = None
 
 
 @dataclass
@@ -63,6 +65,13 @@ class CheckerOutput:
 
     verdicts: list[ExpenseVerdict]
     stage: str = "checker"
+    provider: str = "anthropic"
+    model: str = ""
+    prompt_version: str = ""
+    settings: dict = field(default_factory=dict)
+    assessments: list = field(default_factory=list)
+    retries: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
 
 
 @dataclass
@@ -91,6 +100,7 @@ class ApprovedExpense:
     checker_verdict: ExpenseVerdict
     verifier_verdict: ExpenseVerdict
     final_status: str  # "approved" | "flagged" | "needs_human_review"
+    reconciliation_rule: str = ""
 
 
 @dataclass

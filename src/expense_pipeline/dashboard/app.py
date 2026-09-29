@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from expense_pipeline.dashboard import local_queries, queries
+from expense_pipeline.decision_view import load_decision_process
 from expense_pipeline.policy_index import PolicyCitation, find_policy_manual, load_policy_citations
 from expense_pipeline.policy_parser import load_policy_rules_yaml, normalize_category
 from expense_pipeline.schemas import Expense
@@ -249,18 +250,31 @@ def _render_expenses_tab(data, conn, run_id: str, citations, policy_rules):
             key="expense_pick",
         )
         selected_expense = next(exp for exp in expenses if exp["report_id"] == selected_report)
-        _render_expense_policy_panel(selected_expense, citations, policy_rules)
+        _render_expense_policy_panel(
+            selected_expense, citations, policy_rules, run_id, panel_key="expenses"
+        )
 
     except Exception as e:
         st.error(f"Failed to load expenses: {e}")
 
 
-def _render_expense_policy_panel(expense: dict, citations, policy_rules) -> None:
+def _render_expense_policy_panel(
+    expense: dict, citations, policy_rules, run_id: str, panel_key: str
+) -> None:
     citation = citations.get(normalize_category(expense.get("category", "")))
     reasons = _expense_reasons(expense, policy_rules)
 
     st.markdown("---")
-    st.subheader(f"{expense['report_id']} — {expense['employee']}")
+    title_col, action_col = st.columns([4, 1])
+    with title_col:
+        st.subheader(f"{expense['report_id']} — {expense['employee']}")
+    with action_col:
+        st.write("")
+        if st.button(
+            "View decision process",
+            key=f"view_decision_{panel_key}_{run_id}_{expense['report_id']}",
+        ):
+            st.session_state["decision_focus"] = (run_id, expense["report_id"])
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -322,13 +336,21 @@ def _render_expense_policy_panel(expense: dict, citations, policy_rules) -> None
                 f"receipt required above ${rule.receipt_required_above:.0f}{approval}"
             )
 
+    focus = st.session_state.get("decision_focus")
+    if focus == (run_id, expense["report_id"]):
+        _render_decision_process(run_id, expense["report_id"])
+
+
+def _split_stored_reasons(stored) -> list[str]:
+    if isinstance(stored, list):
+        return [str(part) for part in stored if str(part).strip()]
+    return [part.strip() for part in str(stored).replace("|", ";").split(";") if part.strip()]
+
 
 def _expense_reasons(expense: dict, policy_rules) -> list[str]:
     stored = expense.get("checker_reasons") or expense.get("verifier_reasons")
     if stored:
-        if isinstance(stored, list):
-            return stored
-        return [part.strip() for part in str(stored).split(";") if part.strip()]
+        return _split_stored_reasons(stored)
     if not policy_rules:
         return []
     reconstructed = Expense(
@@ -416,10 +438,135 @@ def _render_needs_review_tab(data, conn, run_id: str, citations, policy_rules):
         ]
         selected_label = st.selectbox("Pull up an expense", labels, key="needs_review_pick")
         selected = needs_review[labels.index(selected_label)]
-        _render_expense_policy_panel(selected, citations, policy_rules)
+        _render_expense_policy_panel(
+            selected, citations, policy_rules, run_id, panel_key="needs_review"
+        )
 
     except Exception as e:
         st.error(f"Failed to load needs-review expenses: {e}")
+
+
+def _render_decision_process(run_id: str, expense_id: str) -> None:
+    """Show the stored decision log. This does not call a model or the verifier."""
+    st.markdown("### Decision process")
+    try:
+        view = load_decision_process(run_id, expense_id)
+    except Exception as exc:
+        st.error(f"Could not read the decision log: {exc}")
+        return
+
+    if view["status"] == "legacy":
+        st.warning(f"{view['headline']}: {view['detail']}")
+    elif view["status"] == "incomplete":
+        st.warning(f"{view['headline']}: {view['detail']}")
+    else:
+        st.caption(view["detail"])
+
+    sections = view["sections"]
+    outcome = sections.get("outcome") or {}
+    if outcome:
+        st.markdown(
+            f"**Outcome:** {outcome.get('final_outcome')} · "
+            f"decision `{outcome.get('decision_id')}` · "
+            f"component `{outcome.get('responsible_component')}`"
+        )
+
+    evidence = sections.get("evidence") or {}
+    if evidence:
+        st.markdown("**Evidence**")
+        st.write(
+            {
+                "source_row": evidence.get("source_row"),
+                "input_facts": evidence.get("input_facts"),
+            }
+        )
+
+    policy = sections.get("policy") or {}
+    if policy:
+        st.markdown("**Policy snapshot and applied clauses**")
+        st.write(policy.get("snapshot"))
+        for clause in policy.get("applied_clauses") or []:
+            st.write(
+                f"- {clause.get('clause')}: {clause.get('result')} "
+                f"(threshold {clause.get('threshold')}, observed {clause.get('observed_value')})"
+            )
+
+    ai = sections.get("ai_assessment") or {}
+    if ai:
+        st.markdown(f"**{ai.get('label', 'AI assessment')}**")
+        if ai.get("note"):
+            st.caption(ai["note"])
+        st.write(
+            {
+                "verdict": ai.get("verdict"),
+                "stated_justification": ai.get("stated_justification"),
+                "citations": ai.get("citations"),
+                "citations_complete": ai.get("citations_complete"),
+                "provider": ai.get("provider"),
+                "model": ai.get("model"),
+                "prompt_version": ai.get("prompt_version"),
+                "settings": ai.get("settings"),
+                "output_status": ai.get("output_status"),
+            }
+        )
+
+    probability = sections.get("probability") or {}
+    st.markdown(f"**{probability.get('label', 'Model output probability')}**")
+    if probability.get("value") is None:
+        st.write(f"Not available ({probability.get('reason') or 'missing'}).")
+    else:
+        st.write(
+            f"{probability['value']:.6f} from {probability.get('provider')} / {probability.get('model')}"
+        )
+        if probability.get("logprob") is not None:
+            st.caption(f"Label-token logprob: {probability['logprob']}")
+        alternatives = probability.get("alternatives") or []
+        if alternatives:
+            st.write("Alternative tokens returned with that label:")
+            st.write(alternatives)
+    st.caption(probability.get("explanation", ""))
+
+    verifier = sections.get("verifier")
+    if verifier:
+        st.markdown("**Verifier results**")
+        st.write(
+            {
+                "verdict": verifier.get("verdict"),
+                "reasons": verifier.get("reasons"),
+                "observed_values": verifier.get("observed_values"),
+                "checks": verifier.get("checks"),
+            }
+        )
+
+    reconciliation = sections.get("reconciliation") or {}
+    if reconciliation:
+        st.markdown("**Reconciliation**")
+        st.write(
+            {
+                "rule": reconciliation.get("rule"),
+                "disagreement": reconciliation.get("disagreement"),
+                "human_review": reconciliation.get("human_review"),
+                "overrides": reconciliation.get("overrides"),
+                "errors": reconciliation.get("errors"),
+                "retries": reconciliation.get("retries"),
+            }
+        )
+
+    st.markdown("**Event timeline**")
+    timeline = sections.get("timeline") or []
+    if not timeline:
+        st.write("No stored events.")
+        return
+    for event in timeline:
+        st.write(
+            f"- {event.get('occurred_at')} · {event.get('component')} · {event.get('event_type')}"
+        )
+        payload = event.get("payload") or {}
+        if event.get("event_type") == "ai_stated_output":
+            st.caption("Model-stated justification, not an observed chain of reasoning.")
+            st.write(payload.get("stated_justification"))
+        elif payload:
+            st.json(payload)
 
 
 if __name__ == "__main__":

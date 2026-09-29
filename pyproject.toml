@@ -17,6 +17,7 @@ dependencies = [
     "snowflake-snowpark-python>=1.0",
     "streamlit>=1.28",
     "anthropic>=0.25",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]

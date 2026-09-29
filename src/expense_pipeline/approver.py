@@ -8,6 +8,12 @@ from .schemas import (
 )
 from .gates import gate_approver, GateFailure
 
+# Exact reconciliation rules. Label probabilities are not an input.
+RECONCILE_BOTH_APPROVED = "approve_when_checker_and_verifier_both_approved"
+RECONCILE_BOTH_FLAGGED = "flag_when_checker_and_verifier_both_flagged_with_equal_reasons"
+RECONCILE_FLAG_REASON_MISMATCH = "needs_human_review_when_both_flagged_but_reasons_differ"
+RECONCILE_VERDICT_MISMATCH = "needs_human_review_when_checker_and_verifier_verdicts_differ"
+
 
 def approve_expenses(
     expenses: list[Expense],
@@ -35,17 +41,18 @@ def approve_expenses(
         if not checker_verdict or not verifier_verdict:
             raise ValueError(f"Missing verdict for {expense.report_id}")
 
-        # Determine final status
         if checker_verdict.verdict == verifier_verdict.verdict == "approved":
             final_status = "approved"
+            reconciliation_rule = RECONCILE_BOTH_APPROVED
         elif checker_verdict.verdict == verifier_verdict.verdict == "flagged":
-            # Both flagged — check if reasons match
             checker_reasons_set = set(checker_verdict.reasons)
             verifier_reasons_set = set(verifier_verdict.reasons)
             if checker_reasons_set == verifier_reasons_set:
                 final_status = "flagged"
+                reconciliation_rule = RECONCILE_BOTH_FLAGGED
             else:
                 final_status = "needs_human_review"
+                reconciliation_rule = RECONCILE_FLAG_REASON_MISMATCH
                 disagreements.append(
                     VerdictComparison(
                         report_id=expense.report_id,
@@ -55,8 +62,8 @@ def approve_expenses(
                     )
                 )
         else:
-            # Disagreement: one approved, one flagged
             final_status = "needs_human_review"
+            reconciliation_rule = RECONCILE_VERDICT_MISMATCH
             disagreements.append(
                 VerdictComparison(
                     report_id=expense.report_id,
@@ -72,6 +79,7 @@ def approve_expenses(
                 checker_verdict=checker_verdict,
                 verifier_verdict=verifier_verdict,
                 final_status=final_status,
+                reconciliation_rule=reconciliation_rule,
             )
         )
 

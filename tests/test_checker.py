@@ -86,6 +86,10 @@ def test_check_compliance_basic(mock_anthropic_class):
     assert output.verdicts[0].report_id == "EXP-0001"
     assert output.verdicts[0].verdict == "approved"
     assert output.verdicts[1].verdict == "flagged"
+    assert output.assessments[0]["citations_complete"] is False
+    assert output.assessments[1]["citations_complete"] is True
+    assert output.assessments[0]["kind"] == "model_stated_output"
+    assert output.assessments[0]["label_probability"] is None
 
 
 @patch("src.expense_pipeline.checker.Anthropic")

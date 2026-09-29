@@ -1,5 +1,6 @@
 """End-to-end tests for the full pipeline."""
 
+import argparse
 import pytest
 import tempfile
 import json
@@ -164,6 +165,73 @@ def test_end_to_end_with_checker(mock_anthropic_class):
         # Check for disagreements if verdicts don't match
         if disagreements:
             assert len(disagreements) > 0
+
+
+@patch("src.expense_pipeline.checker.Anthropic")
+def test_cli_run_persists_decision_log_and_csv(mock_anthropic_class):
+    """A local run writes the versioned decision log and keeps the original CSV columns."""
+    from src.expense_pipeline.cli import run_pipeline
+    from src.expense_pipeline.decision_store import DecisionStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        spreadsheet_path = tmpdir / "expenses.xlsx"
+        policy_path = tmpdir / "policy.docx"
+        create_test_spreadsheet(str(spreadsheet_path), num_rows=2)
+        create_test_policy_doc(str(policy_path))
+
+        mock_response_data = [
+            {
+                "report_id": "EXP-0000",
+                "verdict": "approved",
+                "reasons": ["Stated as acceptable."],
+                "rule_citations": ["meals.daily_limit"],
+            },
+            {
+                "report_id": "EXP-0001",
+                "verdict": "approved",
+                "reasons": ["Stated as acceptable."],
+                "rule_citations": [],
+            },
+        ]
+        mock_client = Mock()
+        mock_anthropic_class.return_value = mock_client
+        mock_client.messages.create.return_value = Mock(
+            content=[Mock(text=json.dumps(mock_response_data))]
+        )
+
+        run_pipeline(
+            argparse.Namespace(
+                spreadsheet=str(spreadsheet_path),
+                policy=str(policy_path),
+                policy_yaml=str(tmpdir / "policy_rules.yaml"),
+                audit_dir=str(tmpdir / "audit"),
+                reports_dir=str(tmpdir / "reports"),
+                load_to_snowflake=False,
+                model="claude-haiku-4-5",
+                checker_provider="anthropic",
+            )
+        )
+
+        audit_json = next((tmpdir / "audit").glob("*.json"))
+        run_id = audit_json.stem
+        store = DecisionStore(tmpdir / "audit" / "decision_log.sqlite")
+        first = store.get_latest(run_id, "EXP-0000")
+        second = store.get_latest(run_id, "EXP-0001")
+        assert first["ai_assessment"]["model"] == "claude-haiku-4-5"
+        assert first["ai_assessment"]["stated_justification"] == ["Stated as acceptable."]
+        assert first["source_row"] == 2
+        assert first["human_review"] is None
+        assert "decision_recorded" in {
+            event["event_type"] for event in store.list_events(run_id, "EXP-0000")
+        }
+        csv_text = (tmpdir / "reports" / f"{run_id}_verdicts.csv").read_text(encoding="utf-8")
+        header = csv_text.splitlines()[0]
+        assert header.startswith(
+            "report_id,employee,department,category,amount,receipt,checker_verdict,verifier_verdict,final_status"
+        )
+        assert "reconciliation_rule" in header
+        assert second["ai_assessment"]["citations_complete"] is False
 
 
 def test_end_to_end_department_handling():

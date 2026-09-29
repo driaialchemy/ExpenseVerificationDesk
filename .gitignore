@@ -52,6 +52,9 @@ htmlcov/
 # Pipeline outputs (gitignored)
 audit/
 reports/
+*.sqlite
+*.sqlite3
+*.db
 
 # Streamlit
 .streamlit/
