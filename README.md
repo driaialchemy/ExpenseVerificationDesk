@@ -172,12 +172,16 @@ expenseverificationpipeline/
 ├── src/expense_pipeline/
 │   ├── __init__.py
 │   ├── cli.py                         # CLI entry point
-│   ├── schemas.py                     # 15 dataclasses for all artifacts
+│   ├── schemas.py                     # Data models for pipeline artifacts
 │   ├── ingestion.py                   # Stage 1: Parse Excel
 │   ├── policy_parser.py               # Stage 2: Parse Word policy
-│   ├── checker.py                     # Stage 3: LLM compliance check
+│   ├── checker.py                     # Stage 3: Anthropic compliance check
+│   ├── openai_checker.py              # Stage 3: optional OpenAI A/B observation mode
 │   ├── verifier.py                    # Stage 4: Pure code verification
 │   ├── approver.py                    # Stage 5: Reconcile verdicts
+│   ├── decision_store.py              # Versioned SQLite decision log
+│   ├── decision_builder.py            # Assemble a decision record from artifacts
+│   ├── decision_view.py               # Read a stored decision for the dashboard
 │   ├── snowflake_loader.py            # Stage 6: Load to Snowflake
 │   ├── gates.py                       # 6 gate checks + logging
 │   ├── audit.py                       # JSON audit trail
@@ -185,13 +189,15 @@ expenseverificationpipeline/
 │   └── dashboard/
 │       ├── app.py                     # Streamlit dashboard
 │       └── queries.py                 # 8 named SQL queries
-├── tests/                             # 31 tests (100% passing)
+├── tests/                             # mocked local suite; re-run pytest for the count
 │   ├── test_ingestion.py
 │   ├── test_policy_parser.py
 │   ├── test_checker.py
+│   ├── test_openai_checker.py
 │   ├── test_verifier.py
 │   ├── test_gates.py
 │   ├── test_snowflake_loader.py
+│   ├── test_decision_process.py
 │   └── test_end_to_end.py
 ├── sql/
 │   └── 001_create_tables.sql         # Snowflake schema (EXPENSE_VERDICTS + RUN_SUMMARY)
@@ -469,7 +475,17 @@ For issues or questions:
 
 The verifier treats `daily_limit` as a total for the same employee, calendar day, category, and currency. It does not convert currencies. Receipt and manager-approval thresholds stay on the individual line. Every clause the verifier actually applies is cited, including clauses that pass.
 
-OpenAI checker mode is off unless `EXPENSE_CHECKER_PROVIDER=openai`. It asks for one label token, `approved` or `flagged`, records that token's logprob when the endpoint returns one, and converts it with `exp(logprob)`. A separate call asks for the explanation. Missing scores stay null with a reason. The dashboard calls this **Model output probability** and states that it is not the probability the decision is correct. The score does not change the approval.
+Both checker modes receive the other input rows in that same daily group before they answer. The assessment records those rows. The checker does not receive the verifier's verdict, and the verifier does not read the checker's output.
+
+A model's citation list is complete only when it names every clause that applies to that expense's category and does not name a clause outside that set. Missing and unsupported citations are stored as gaps. The pipeline does not invent a citation to fill them, and it keeps the model's original text.
+
+OpenAI checker mode is off unless `EXPENSE_CHECKER_PROVIDER=openai`. It asks for one short label: `A` means approved and `B` means flagged. The words `approved` and `flagged` are not the scored tokens. On the `gpt-4o-mini` tokenizer (`o200k_base`), `flagged` is two tokens, so a score is stored only after tiktoken confirms that the returned label is one token for the configured model. If the tokenizer cannot be confirmed, the mapped label can still be kept and the probability stays null. A stored score is `exp(logprob)` of that token. Positive, non-finite, and malformed logprobs stay null. `finish_reason` `length` with an incomplete label is truncation; a complete `A` or `B` can still be scored when the token cap is 1. A second call asks for the explanation. The classification event is written before that call. The dashboard calls the score **Model output probability** and states that it is not the probability the decision is correct. The score does not change the approval.
+
+Chat Completions logprobs are documented at https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create/. Support is a property of the endpoint response, not a guarantee from the model name. The tests use a fake client.
+
+Policy and input snapshots are written before the first model call. Classification, explanation, retries, and failures are written as they occur. A failed mandatory write stops later model calls, finalization, and Snowflake loading. Earlier events remain in the log.
+
+The dashboard can show a local run whose id starts with `offline-demo`. That run is synthetic stored text, not a paid model call and not a Snowflake write. `reports/` and `audit/` are not in Git.
 
 ```powershell
 $env:EXPENSE_CHECKER_PROVIDER = "openai"
@@ -487,8 +503,8 @@ That command calls the configured endpoint. The test suite does not.
 - Snowflake integration with independent verification
 - Streamlit dashboard (standalone + Snowflake-native)
 - CLI with audit trail and CSV reports
-- 31 passing tests
-- Full documentation
+- Initial local test suite
+- Documentation for the prototype
 
 ---
 

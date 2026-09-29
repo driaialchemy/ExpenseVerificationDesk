@@ -121,6 +121,10 @@ def _sections(record: dict, events: list[dict]) -> dict:
             "stated_justification": ai.get("stated_justification"),
             "citations": ai.get("citations"),
             "citations_complete": ai.get("citations_complete"),
+            "citation_coverage": ai.get("citation_coverage"),
+            "original_text": ai.get("original_text"),
+            "facts_received": ai.get("facts_received"),
+            "label_mapping": ai.get("label_mapping"),
             "provider": ai.get("provider"),
             "model": ai.get("model"),
             "prompt_version": ai.get("prompt_version"),
@@ -140,6 +144,7 @@ def _sections(record: dict, events: list[dict]) -> dict:
         "verifier": record.get("verifier"),
         "reconciliation": {
             "rule": record.get("reconciliation_rule"),
+            "explanation": record.get("reconciliation_explanation"),
             "disagreement": record.get("disagreement"),
             "final_outcome": record.get("final_outcome"),
             "human_review": record.get("human_review"),

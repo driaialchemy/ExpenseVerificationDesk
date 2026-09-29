@@ -82,6 +82,11 @@ def main():
         st.metric("Needs Review", run_summary["needs_review_count"])
 
     st.text(f"Run timestamp: {run_summary['run_timestamp']}")
+    if str(selected_run_id).startswith("offline-demo"):
+        st.info(
+            "Offline demo. These rows are synthetic and the model text was stored locally. "
+            "This run did not call a paid model and did not write to Snowflake."
+        )
 
     citations = _load_citations()
     policy_rules = _load_policy_rules()
@@ -481,14 +486,24 @@ def _render_decision_process(run_id: str, expense_id: str) -> None:
             }
         )
 
+    facts_received = (sections.get("ai_assessment") or {}).get("facts_received") or {}
+    if facts_received:
+        st.markdown("**Daily context the model received**")
+        st.caption("Input rows only. Checker and verifier verdicts are not included.")
+        st.write(facts_received)
+
     policy = sections.get("policy") or {}
     if policy:
         st.markdown("**Policy snapshot and applied clauses**")
         st.write(policy.get("snapshot"))
         for clause in policy.get("applied_clauses") or []:
+            extra = ""
+            contributors = clause.get("contributing_report_ids")
+            if contributors:
+                extra = f", contributing {', '.join(str(item) for item in contributors)}"
             st.write(
                 f"- {clause.get('clause')}: {clause.get('result')} "
-                f"(threshold {clause.get('threshold')}, observed {clause.get('observed_value')})"
+                f"(threshold {clause.get('threshold')}, observed {clause.get('observed_value')}{extra})"
             )
 
     ai = sections.get("ai_assessment") or {}
@@ -502,6 +517,9 @@ def _render_decision_process(run_id: str, expense_id: str) -> None:
                 "stated_justification": ai.get("stated_justification"),
                 "citations": ai.get("citations"),
                 "citations_complete": ai.get("citations_complete"),
+                "citation_coverage": ai.get("citation_coverage"),
+                "original_text": ai.get("original_text"),
+                "label_mapping": ai.get("label_mapping"),
                 "provider": ai.get("provider"),
                 "model": ai.get("model"),
                 "prompt_version": ai.get("prompt_version"),
@@ -544,6 +562,7 @@ def _render_decision_process(run_id: str, expense_id: str) -> None:
         st.write(
             {
                 "rule": reconciliation.get("rule"),
+                "explanation": reconciliation.get("explanation"),
                 "disagreement": reconciliation.get("disagreement"),
                 "human_review": reconciliation.get("human_review"),
                 "overrides": reconciliation.get("overrides"),

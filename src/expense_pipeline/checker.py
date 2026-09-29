@@ -9,11 +9,17 @@ from typing import Optional
 import httpx
 from anthropic import Anthropic
 
-from .decision_builder import citations_are_complete, known_clause_ids
+from .audit import AuditWriteError
+from .decision_builder import (
+    applicable_clause_ids,
+    citation_coverage,
+    model_input_facts,
+    render_daily_context,
+)
 from .schemas import Expense, PolicyRules, ExpenseVerdict, CheckerOutput
 from .gates import gate_checker, GateFailure
 
-ANTHROPIC_PROMPT_VERSION = "anthropic-json-batch-v1"
+ANTHROPIC_PROMPT_VERSION = "anthropic-json-batch-v2"
 AI_NOTE = (
     "stated_justification is text the model produced. "
     "It is not an observation of the model's internal reasoning."
@@ -83,6 +89,8 @@ def check_compliance(
     policy_rules: PolicyRules,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    audit=None,
+    run_id: Optional[str] = None,
 ) -> CheckerOutput:
     """
     Use LLM to perform compliance judgment on ambiguous expense rows.
@@ -95,12 +103,27 @@ def check_compliance(
     if resolved_provider == "openai":
         from .openai_checker import check_compliance_openai
 
-        return check_compliance_openai(expenses, policy_rules, model=model)
+        return check_compliance_openai(
+            expenses,
+            policy_rules,
+            model=model,
+            audit=audit,
+            run_id=run_id,
+        )
 
     resolved_model = resolve_model(model)
     try:
-        return _run_checker(_build_client(), expenses, policy_rules, resolved_model)
+        return _run_checker(
+            _build_client(),
+            expenses,
+            policy_rules,
+            resolved_model,
+            audit=audit,
+            run_id=run_id,
+        )
     except Exception as exc:
+        if isinstance(exc, AuditWriteError):
+            raise
         if _is_illegal_api_key_header(exc):
             raise AnthropicConnectionError(_illegal_api_key_message()) from exc
         if _is_model_not_found(exc) or not _is_connection_error(exc):
@@ -113,6 +136,7 @@ def check_compliance(
             "attempted_model": resolved_model,
             "error": _redact_secrets(_exception_chain(exc)),
         }
+        _emit_audit(audit, run_id, None, "retry", retry)
         ipv4_client = _build_client(
             http_client=httpx.Client(
                 timeout=120.0,
@@ -120,7 +144,14 @@ def check_compliance(
             ),
         )
         try:
-            output = _run_checker(ipv4_client, expenses, policy_rules, resolved_model)
+            output = _run_checker(
+                ipv4_client,
+                expenses,
+                policy_rules,
+                resolved_model,
+                audit=audit,
+                run_id=run_id,
+            )
         except Exception as retry_exc:
             if _is_connection_error(retry_exc):
                 raise AnthropicConnectionError(_connection_error_message(retry_exc)) from retry_exc
@@ -134,6 +165,8 @@ def _run_checker(
     expenses: list[Expense],
     policy_rules: PolicyRules,
     model: str,
+    audit=None,
+    run_id: Optional[str] = None,
 ) -> CheckerOutput:
     policy_summary = _build_policy_summary(policy_rules)
     expenses_text = _build_expenses_text(expenses)
@@ -151,23 +184,44 @@ Respond with a JSON array of verdicts. Each verdict should follow this schema:
   "rule_citations": ["meals.daily_limit", "meals.receipt_required_above"]
 }}
 
-rule_citations must name every policy clause you applied, using ids like meals.daily_limit.
-If you cannot cite a clause, return an empty list rather than inventing one.
+rule_citations must name every policy clause that applies to that expense's category.
+If you cannot cite a clause, leave it out. Do not invent a citation.
+
+For each expense, use the daily context below. A daily limit is the total for the same employee, calendar day, category, and currency. Do not convert currencies.
 
 For each expense, check:
-1. Amount does not exceed daily category limit
+1. The daily total does not exceed the category daily limit
 2. Receipt requirement met (if amount over threshold, receipt must be attached)
 3. Manager approval requirement met (if software/client_entertainment over threshold, needs approval)
 
 Be conservative: flag any ambiguous cases for human review in reasons."""
 
+    daily_context = render_daily_context(expenses)
     expenses_prompt = f"""Please review these expenses for policy compliance:
 
 {expenses_text}
 
+{daily_context}
+
 Return a JSON array with one verdict per expense, in the same order."""
 
     settings = {"max_tokens": 4096, "temperature": None}
+    _emit_audit(
+        audit,
+        run_id,
+        None,
+        "request_started",
+        {
+            "provider": "anthropic",
+            "requested_model": model,
+            "prompt_version": ANTHROPIC_PROMPT_VERSION,
+            "settings": settings,
+            "prompt_row_ids": [expense.report_id for expense in expenses],
+            "facts_received": [
+                model_input_facts(expense, expenses) for expense in expenses
+            ],
+        },
+    )
     response, model_used, retries = _create_message(
         client,
         model,
@@ -177,6 +231,8 @@ Return a JSON array with one verdict per expense, in the same order."""
     )
 
     response_text = response.content[0].text
+    for retry in retries:
+        _emit_audit(audit, run_id, None, "retry", retry)
 
     try:
         json_start = response_text.find("[")
@@ -184,6 +240,17 @@ Return a JSON array with one verdict per expense, in the same order."""
         json_str = response_text[json_start:json_end]
         verdicts_data = json.loads(json_str)
     except (json.JSONDecodeError, ValueError) as e:
+        _emit_audit(
+            audit,
+            run_id,
+            None,
+            "error",
+            {
+                "output_status": "invalid",
+                "error": f"Failed to parse LLM response: {e}",
+                "original_text": response_text,
+            },
+        )
         raise ValueError(f"Failed to parse LLM response: {e}\n\nResponse: {response_text}")
 
     verdicts = []
@@ -199,30 +266,39 @@ Return a JSON array with one verdict per expense, in the same order."""
         except KeyError as e:
             raise ValueError(f"Missing field in verdict: {e}")
 
-    clause_ids = known_clause_ids(policy_rules)
+    expenses_by_id = {expense.report_id: expense for expense in expenses}
     assessments = []
     for verdict in verdicts:
+        expense = expenses_by_id.get(verdict.report_id)
+        applicable = applicable_clause_ids(expense, policy_rules) if expense else []
         citations = list(verdict.rule_citations)
-        assessments.append(
-            {
-                "kind": "model_stated_output",
-                "note": AI_NOTE,
-                "report_id": verdict.report_id,
-                "verdict": verdict.verdict,
-                "stated_justification": list(verdict.reasons),
-                "citations": citations,
-                "citations_complete": citations_are_complete(citations, clause_ids),
-                "provider": "anthropic",
-                "model": model_used,
-                "prompt_version": ANTHROPIC_PROMPT_VERSION,
-                "settings": settings,
-                "output_status": "ok",
-                "label_logprob": None,
-                "label_probability": None,
-                "probability_unavailable_reason": "provider_does_not_return_label_logprobs",
-                "alternatives": [],
-            }
-        )
+        coverage = citation_coverage(citations, applicable)
+        assessment = {
+            "kind": "model_stated_output",
+            "note": AI_NOTE,
+            "report_id": verdict.report_id,
+            "verdict": verdict.verdict,
+            "stated_justification": list(verdict.reasons),
+            "citations": citations,
+            "citations_complete": coverage["complete"],
+            "citation_coverage": coverage,
+            "original_text": response_text,
+            "facts_received": {
+                **(model_input_facts(expense, expenses) if expense else {}),
+                "prompt_row_ids": [item.report_id for item in expenses],
+            },
+            "provider": "anthropic",
+            "model": model_used,
+            "prompt_version": ANTHROPIC_PROMPT_VERSION,
+            "settings": settings,
+            "output_status": "ok",
+            "label_logprob": None,
+            "label_probability": None,
+            "probability_unavailable_reason": "provider_does_not_return_label_logprobs",
+            "alternatives": [],
+        }
+        _emit_audit(audit, run_id, verdict.report_id, "ai_stated_output", assessment)
+        assessments.append(assessment)
 
     output = CheckerOutput(
         verdicts=verdicts,
@@ -365,6 +441,14 @@ def _build_policy_summary(policy_rules: PolicyRules) -> str:
                 f"  Manager approval required if > ${rule.requires_manager_approval_above}"
             )
     return "\n".join(lines)
+
+
+def _emit_audit(audit, run_id: Optional[str], expense_id: Optional[str], event_type: str, payload: dict) -> None:
+    if audit is None:
+        return
+    if not run_id:
+        raise AuditWriteError("A decision-log write requires a run id")
+    audit.append_event(run_id, expense_id, "checker", event_type, payload)
 
 
 def _build_expenses_text(expenses: list[Expense]) -> str:

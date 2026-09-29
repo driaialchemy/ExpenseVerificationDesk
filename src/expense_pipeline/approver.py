@@ -14,6 +14,31 @@ RECONCILE_BOTH_FLAGGED = "flag_when_checker_and_verifier_both_flagged_with_equal
 RECONCILE_FLAG_REASON_MISMATCH = "needs_human_review_when_both_flagged_but_reasons_differ"
 RECONCILE_VERDICT_MISMATCH = "needs_human_review_when_checker_and_verifier_verdicts_differ"
 
+RECONCILIATION_EXPLANATIONS = {
+    RECONCILE_BOTH_APPROVED: (
+        "Both the checker and the verifier returned approved, so the outcome is approved."
+    ),
+    RECONCILE_BOTH_FLAGGED: (
+        "Both the checker and the verifier returned flagged and their reason lists are equal, "
+        "so the outcome is flagged."
+    ),
+    RECONCILE_FLAG_REASON_MISMATCH: (
+        "Both the checker and the verifier returned flagged, but their reason lists differ, "
+        "so the outcome is needs human review."
+    ),
+    RECONCILE_VERDICT_MISMATCH: (
+        "The checker and the verifier returned different verdicts, so the outcome is needs human review."
+    ),
+}
+
+
+def explain_reconciliation(rule: str) -> str:
+    """Return the registered meaning of a reconciliation rule id."""
+    return RECONCILIATION_EXPLANATIONS.get(
+        rule,
+        f"The recorded rule id is {rule}. No additional explanation is registered for that id.",
+    )
+
 
 def approve_expenses(
     expenses: list[Expense],

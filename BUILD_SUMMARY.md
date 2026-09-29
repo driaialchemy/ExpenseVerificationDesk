@@ -11,12 +11,16 @@ expense-verification-pipeline/
 ├── src/expense_pipeline/
 │   ├── __init__.py
 │   ├── cli.py                    # CLI entry point
-│   ├── schemas.py                # Data models (15 dataclasses)
+│   ├── schemas.py                # Data models
 │   ├── ingestion.py              # Stage 1: Excel parsing
 │   ├── policy_parser.py          # Stage 2: DOCX policy extraction
-│   ├── checker.py                # Stage 3: LLM-assisted checking
+│   ├── checker.py                # Stage 3: Anthropic checking
+│   ├── openai_checker.py         # Stage 3: optional OpenAI A/B mode
 │   ├── verifier.py               # Stage 4: Pure code verification
 │   ├── approver.py               # Stage 5: Verdict reconciliation
+│   ├── decision_store.py         # Versioned SQLite decision log
+│   ├── decision_builder.py       # Decision record assembly
+│   ├── decision_view.py          # Stored decision view
 │   ├── snowflake_loader.py       # Stage 6: Snowflake write
 │   ├── gates.py                  # Gate checks (6 gates)
 │   ├── audit.py                  # Audit trail logging
@@ -25,13 +29,15 @@ expense-verification-pipeline/
 │       ├── app.py                # Streamlit dashboard
 │       └── queries.py            # SQL queries (8 queries)
 ├── tests/
-│   ├── test_ingestion.py         # 4 tests
-│   ├── test_policy_parser.py     # 4 tests
-│   ├── test_checker.py           # 4 tests
-│   ├── test_verifier.py          # 6 tests
-│   ├── test_gates.py             # 4 tests
-│   ├── test_snowflake_loader.py  # 6 tests
-│   └── test_end_to_end.py        # 3 tests
+│   ├── test_ingestion.py
+│   ├── test_policy_parser.py
+│   ├── test_checker.py
+│   ├── test_openai_checker.py
+│   ├── test_verifier.py
+│   ├── test_gates.py
+│   ├── test_snowflake_loader.py
+│   ├── test_decision_process.py
+│   └── test_end_to_end.py
 ├── sql/
 │   └── 001_create_tables.sql     # Schema DDL
 ├── pyproject.toml                # Package config
@@ -43,7 +49,7 @@ expense-verification-pipeline/
 
 ### Test Results
 
-Local `pytest` covers ingestion, policy parsing, the checker (including the configured model id), the verifier, gates, the Snowflake loader with mocks, end-to-end temp files, the decision log, OpenAI logprob handling with a fake client, and dashboard retrieval. Re-run `pytest tests/ -q` for the current count. No live model or Snowflake call is part of that suite.
+Local `pytest` covers ingestion, policy parsing, the checker (including the configured model id and same-day input rows), the verifier, gates, the Snowflake loader with mocks, end-to-end temp files, the decision log, OpenAI A/B logprob handling with a fake client, citation coverage, and a midway audit-write failure. On 2026-09-28 that mocked suite was 77 passed. Re-run `pytest tests/ -q` for the current count. No live model or Snowflake call is part of that suite.
 
 ### Verified Features
 
@@ -89,9 +95,12 @@ Local `pytest` covers ingestion, policy parsing, the checker (including the conf
 
 #### OpenAI observation mode
 - [x] Anthropic remains the default checker
-- [x] OpenAI mode classifies with the labels `approved` and `flagged`, then requests a separate explanation
-- [x] Label-token logprobs are stored only for that model and converted with `exp(logprob)`
-- [x] Invalid labels, refusals, and missing scores are explicit; missing probabilities stay null
+- [x] OpenAI mode classifies with short labels `A` (approved) and `B` (flagged), then requests a separate explanation
+- [x] A score is stored only after tiktoken confirms the returned label is one token for the configured model
+- [x] The score is `exp(logprob)` of that token; positive, non-finite, and malformed logprobs stay null
+- [x] `flagged` is not scored as a word; on `gpt-4o-mini` / `o200k_base` it is two tokens
+- [x] Classification is written before the explanation call
+- [x] Invalid labels, refusals, truncation, and missing scores are explicit
 - [x] Probabilities do not change the approver
 
 #### Daily limit
@@ -99,6 +108,9 @@ Local `pytest` covers ingestion, policy parsing, the checker (including the conf
 - [x] Different currencies are not converted or added together
 - [x] Receipt and manager-approval checks stay per line
 - [x] Applied clauses are cited on pass and fail
+- [x] Both checkers receive the same-employee/day/category/currency input rows, and the assessment records those rows
+- [x] Checker citation coverage is complete only when every applicable clause for that expense is cited and no extra citation is present
+- [x] The model's original text is kept; missing citations are not invented
 
 #### Safety & Design
 - [x] No secrets in git (.env gitignored)
@@ -146,7 +158,7 @@ streamlit run src/expense_pipeline/dashboard/app.py
 2. **Python 3.11+**: Requires Python 3.11 or later
 3. **Character Encoding**: CLI uses ASCII-safe output for Windows compatibility
 4. **Policy Parser**: Improved to handle real Word documents with flexible table parsing
-5. **All tests mocked**: Snowflake and Anthropic calls are mocked in unit tests
+5. **Mocked tests are not live tests**: Snowflake, Anthropic, and OpenAI calls are mocked. A live run still needs the provider key and, for Snowflake, the connection environment variables.
 
 ## What Was Built
 
@@ -155,6 +167,6 @@ This prototype demonstrates:
 - Gate checks on artifacts
 - A versioned local decision log
 - A dashboard that can show the stored decision process
-- An optional OpenAI label-probability mode that does not change approvals
+- An optional OpenAI label-probability mode that scores A/B and does not change approvals
 
 It is not a claim that the prototype is ready for production, and it is not a measurement of how often the verdicts would match a human reviewer.

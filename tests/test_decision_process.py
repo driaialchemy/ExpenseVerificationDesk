@@ -125,6 +125,9 @@ def test_decision_lineage_and_reopen(tmp_path):
     assert latest["verifier"]["observed_values"]["meals.daily_limit"] == 50.0
     assert latest["final_outcome"] == "approved"
     assert latest["reconciliation_rule"] == RECONCILE_BOTH_APPROVED
+    assert "both the checker and the verifier returned approved" in latest[
+        "reconciliation_explanation"
+    ].lower()
     assert latest["human_review"] is None
     assert latest["retries"][0]["action"] == "retry_over_ipv4"
     events = reopened.list_events("run1", "EXP-0001")
@@ -288,6 +291,48 @@ def test_decision_view_does_not_import_a_model_client():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
     assert imported.isdisjoint({"httpx", "anthropic", "openai", "requests", "urllib", "socket"})
+
+
+def test_citation_coverage_uses_applicable_clauses_and_keeps_original_text():
+    from src.expense_pipeline.decision_builder import applicable_clause_ids, citation_coverage
+
+    expense = _expense()
+    applicable = applicable_clause_ids(expense, _policy())
+    stated = ["meals.daily_limit"]
+    partial = citation_coverage(stated, applicable)
+    assert partial["complete"] is False
+    assert partial["missing"] == ["meals.receipt_required_above"]
+    assert partial["stated"] == ["meals.daily_limit"]
+    assert stated == ["meals.daily_limit"]
+
+    original = ["meals.daily_limit", "meals.receipt_required_above", "travel.daily_limit"]
+    extra = citation_coverage(list(original), applicable)
+    assert extra["complete"] is False
+    assert "travel.daily_limit" in extra["unsupported"]
+    assert original == ["meals.daily_limit", "meals.receipt_required_above", "travel.daily_limit"]
+
+    complete = citation_coverage(
+        ["meals.receipt_required_above", "meals.daily_limit"],
+        applicable,
+    )
+    assert complete["complete"] is True
+    assert complete["missing"] == []
+    assert complete["unsupported"] == []
+
+
+def test_pre_inference_write_failure_stops_before_the_checker(tmp_path):
+    from src.expense_pipeline.cli import persist_pre_inference_snapshots
+
+    store = DecisionStore(tmp_path / "decision_log.sqlite")
+    store.start_run("run1", "expenses.xlsx", "policy.docx", "openai")
+
+    class Boom:
+        def append_event(self, *args, **kwargs):
+            raise AuditWriteError("snapshot write failed")
+
+    with pytest.raises(AuditWriteError, match="snapshot write failed"):
+        persist_pre_inference_snapshots(Boom(), "run1", [_expense()], _policy())
+    assert store.list_events("run1") == []
 
 
 def test_verifier_module_has_no_network_or_llm_imports():

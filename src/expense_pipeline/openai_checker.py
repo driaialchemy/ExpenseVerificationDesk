@@ -1,8 +1,16 @@
 """OpenAI checker mode.
 
-Classify each expense as the single token `approved` or `flagged`, then ask for a
-separate explanation. Label-token logprobs are recorded for observation only.
-They are not an approval threshold and they do not change the verdict.
+Ask for a short label, A or B, then ask for a separate explanation.
+A maps to approved and B maps to flagged. Those words are not assumed to be
+single tokens: on o200k_base, flagged is two tokens. A probability is stored
+only after tiktoken confirms the configured model's encoding uses one token
+for the returned label, and only when that token's logprob is finite and not
+positive. Scores are observational and do not change the verdict.
+
+Chat Completions logprobs are documented at
+https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create/
+finish_reason is stop, length, tool_calls, content_filter, or function_call.
+A logprob of -9999.0 is the documented sentinel for a very unlikely token.
 """
 
 from __future__ import annotations
@@ -15,12 +23,20 @@ from typing import Optional
 
 import httpx
 
-from .decision_builder import citations_are_complete, known_clause_ids
+from .audit import AuditWriteError
+from .decision_builder import (
+    applicable_clause_ids,
+    citation_coverage,
+    model_input_facts,
+    render_daily_context,
+)
+from .policy_parser import normalize_category
 from .schemas import CheckerOutput, Expense, ExpenseVerdict, PolicyRules
+from .verifier import daily_group_key
 
-LABELS = ("approved", "flagged")
-PROMPT_VERSION = "openai-label-then-explain-v1"
-CLASSIFY_MAX_TOKENS = 1
+# Explicit short labels. Do not score the words approved or flagged themselves.
+LABEL_MAP = {"A": "approved", "B": "flagged"}
+PROMPT_VERSION = "openai-label-ab-v1"
 EXPLAIN_MAX_TOKENS = 400
 TOP_LOGPROBS = 5
 AI_NOTE = (
@@ -69,8 +85,38 @@ def build_openai_client() -> httpx.Client:
     )
 
 
-def interpret_label_choice(choice: dict) -> dict:
-    """Read the emitted label and its actual token logprobs. Do not invent a score."""
+def verify_label_tokenization(model: str) -> dict:
+    """Confirm A and B are each one token for this model's tiktoken encoding."""
+    try:
+        import tiktoken
+
+        encoding = tiktoken.encoding_for_model(model)
+    except Exception:
+        return {
+            "verified": False,
+            "encoding": None,
+            "counts": {},
+            "reason": "tokenizer_unverified_for_model",
+            "model": model,
+        }
+    counts = {label: len(encoding.encode(label)) for label in LABEL_MAP}
+    verified = all(count == 1 for count in counts.values())
+    return {
+        "verified": verified,
+        "encoding": encoding.name,
+        "counts": counts,
+        "reason": None if verified else "label_not_single_token_for_model",
+        "model": model,
+    }
+
+
+def interpret_label_choice(choice: dict, verification: Optional[dict] = None) -> dict:
+    """Map A/B to approved/flagged and keep a score only when the token is valid."""
+    verification = verification or {
+        "verified": False,
+        "reason": "tokenizer_unverified_for_model",
+        "counts": {},
+    }
     message = choice.get("message") or {}
     refusal = message.get("refusal")
     finish = choice.get("finish_reason")
@@ -78,7 +124,10 @@ def interpret_label_choice(choice: dict) -> dict:
     text = content.strip() if isinstance(content, str) else ""
     result = {
         "label": None,
+        "raw_label": text or None,
+        "label_mapping": dict(LABEL_MAP),
         "output_status": "invalid",
+        "finish_reason": finish,
         "token_text": None,
         "token_count": 0,
         "label_logprob": None,
@@ -92,7 +141,11 @@ def interpret_label_choice(choice: dict) -> dict:
         result["output_status"] = "refusal"
         result["probability_unavailable_reason"] = "model_refusal"
         return result
+    if finish in {"tool_calls", "function_call"}:
+        result["probability_unavailable_reason"] = "finish_reason_tool_call"
+        return result
 
+    mapped = LABEL_MAP.get(text)
     logprobs = choice.get("logprobs")
     tokens = []
     if isinstance(logprobs, dict) and isinstance(logprobs.get("content"), list):
@@ -106,22 +159,33 @@ def interpret_label_choice(choice: dict) -> dict:
     if tokens:
         result["token_text"] = "".join(str(token.get("token", "")) for token in tokens)
 
-    if text not in LABELS:
-        result["output_status"] = "invalid"
+    if finish == "length" and mapped is None:
+        result["probability_unavailable_reason"] = "truncated"
+        return result
+    if mapped is None:
         result["probability_unavailable_reason"] = (
-            result["probability_unavailable_reason"] or "label_not_approved_or_flagged"
+            result["probability_unavailable_reason"] or "label_not_in_mapping"
         )
         return result
 
-    result["label"] = text
+    result["label"] = mapped
     result["output_status"] = "ok"
-
+    if not verification.get("verified"):
+        result["probability_unavailable_reason"] = verification.get("reason") or (
+            "tokenizer_unverified_for_model"
+        )
+        return result
+    if verification.get("counts", {}).get(text) != 1:
+        result["probability_unavailable_reason"] = "label_not_single_token_for_model"
+        return result
     if not tokens:
         result["probability_unavailable_reason"] = (
             result["probability_unavailable_reason"] or "logprobs_unavailable"
         )
         return result
     if len(tokens) != 1:
+        result["label_logprob"] = None
+        result["label_probability"] = None
         result["probability_unavailable_reason"] = "label_spans_multiple_tokens"
         return result
 
@@ -132,20 +196,29 @@ def interpret_label_choice(choice: dict) -> dict:
     if token_text.strip() != text:
         result["label"] = None
         result["output_status"] = "invalid"
-        result["label_logprob"] = None
-        result["label_probability"] = None
         result["probability_unavailable_reason"] = "token_text_does_not_match_label"
         return result
 
-    logprob = token.get("logprob")
-    if not isinstance(logprob, (int, float)):
-        result["probability_unavailable_reason"] = "label_token_logprob_missing"
+    accepted, reason = _accepted_logprob(token.get("logprob"))
+    if accepted is None:
+        result["probability_unavailable_reason"] = reason
         return result
 
-    result["label_logprob"] = float(logprob)
-    result["label_probability"] = probability_from_logprob(float(logprob))
+    result["label_logprob"] = accepted
+    result["label_probability"] = probability_from_logprob(accepted)
     result["probability_unavailable_reason"] = None
     return result
+
+
+def _accepted_logprob(logprob):
+    """Return a finite logprob that is not positive. Do not coerce other values."""
+    if isinstance(logprob, bool) or not isinstance(logprob, (int, float)):
+        return None, "label_token_logprob_missing"
+    if not math.isfinite(logprob):
+        return None, "logprob_nonfinite"
+    if logprob > 0:
+        return None, "logprob_positive"
+    return float(logprob), None
 
 
 def check_compliance_openai(
@@ -153,21 +226,30 @@ def check_compliance_openai(
     policy_rules: PolicyRules,
     model: Optional[str] = None,
     client: Optional[httpx.Client] = None,
+    audit=None,
+    run_id: Optional[str] = None,
 ) -> CheckerOutput:
     """Classify every expense, then request a separate explanation. Scores are observational."""
     resolved_model = resolve_openai_model(model)
+    verification = verify_label_tokenization(resolved_model)
     owns_client = client is None
     if owns_client:
         client = build_openai_client()
 
-    clause_ids = known_clause_ids(policy_rules)
+    classify_max_tokens = 1 if verification["verified"] else 8
     settings = {
         "classify_temperature": 0,
-        "classify_max_tokens": CLASSIFY_MAX_TOKENS,
+        "classify_max_tokens": classify_max_tokens,
         "logprobs": True,
         "top_logprobs": TOP_LOGPROBS,
         "explain_temperature": 0,
         "explain_max_tokens": EXPLAIN_MAX_TOKENS,
+        "label_mapping": dict(LABEL_MAP),
+        "tokenization": verification,
+        "logprobs_reference": (
+            "https://developers.openai.com/api/reference/resources/chat/"
+            "subresources/completions/methods/create/"
+        ),
     }
     output = CheckerOutput(
         verdicts=[],
@@ -181,17 +263,44 @@ def check_compliance_openai(
     try:
         for index, expense in enumerate(expenses):
             if blocking:
-                output.errors.append(
-                    {
-                        "report_id": expense.report_id,
-                        "output_status": "not_attempted",
-                        "error": "Stopped after an earlier invalid or refused label",
-                    }
-                )
+                skipped = {
+                    "report_id": expense.report_id,
+                    "output_status": "not_attempted",
+                    "error": "Stopped after an earlier invalid or refused label",
+                }
+                output.errors.append(skipped)
+                _emit(audit, run_id, expense.report_id, "error", skipped)
                 continue
+            facts = {
+                **model_input_facts(expense, expenses),
+                "prompt_row_ids": [
+                    row["report_id"] for row in model_input_facts(expense, expenses)["rows"]
+                ],
+            }
+            request_meta = {
+                "provider": "openai",
+                "endpoint": "/chat/completions",
+                "requested_model": resolved_model,
+                "prompt_version": PROMPT_VERSION,
+                "settings": settings,
+                "facts_received": facts,
+            }
             try:
-                choice, call_retries = _classify(client, resolved_model, expense, policy_rules)
+                _emit(audit, run_id, expense.report_id, "request_started", request_meta)
+                choice, call_retries, response_model = _classify(
+                    client,
+                    resolved_model,
+                    expense,
+                    expenses,
+                    policy_rules,
+                    classify_max_tokens,
+                    on_retry=lambda payload: _emit(
+                        audit, run_id, expense.report_id, "retry", payload
+                    ),
+                )
                 output.retries.extend(call_retries)
+            except AuditWriteError:
+                raise
             except Exception as exc:
                 message = _redact(str(exc))
                 output.errors.append(
@@ -223,9 +332,42 @@ def check_compliance_openai(
                     )
                 )
                 blocking = message
+                _emit(
+                    audit,
+                    run_id,
+                    expense.report_id,
+                    "error",
+                    {"output_status": "unavailable", "error": message},
+                )
                 continue
 
-            interpreted = interpret_label_choice(choice)
+            interpreted = interpret_label_choice(choice, verification)
+            interpreted["response_model"] = response_model
+            _emit(
+                audit,
+                run_id,
+                expense.report_id,
+                "classification_observed",
+                {
+                    "raw_label": interpreted.get("raw_label"),
+                    "verdict": interpreted.get("label"),
+                    "label_mapping": interpreted.get("label_mapping"),
+                    "output_status": interpreted.get("output_status"),
+                    "finish_reason": interpreted.get("finish_reason"),
+                    "label_logprob": interpreted.get("label_logprob"),
+                    "label_probability": interpreted.get("label_probability"),
+                    "probability_unavailable_reason": interpreted.get(
+                        "probability_unavailable_reason"
+                    ),
+                    "token_text": interpreted.get("token_text"),
+                    "token_count": interpreted.get("token_count"),
+                    "original_text": interpreted.get("raw_content"),
+                    "facts_received": facts,
+                    "requested_model": resolved_model,
+                    "response_model": response_model,
+                    "provider": "openai",
+                },
+            )
             if interpreted["output_status"] != "ok" or not interpreted["label"]:
                 output.assessments.append(
                     _assessment(
@@ -251,44 +393,83 @@ def check_compliance_openai(
                     f"{expense.report_id} label was {interpreted['output_status']}: "
                     f"{interpreted['probability_unavailable_reason']}"
                 )
+                _emit(
+                    audit,
+                    run_id,
+                    expense.report_id,
+                    "error",
+                    {
+                        "output_status": interpreted["output_status"],
+                        "error": interpreted["probability_unavailable_reason"],
+                        "original_text": interpreted.get("raw_content"),
+                    },
+                )
                 continue
 
             explanation_status = "ok"
             stated: list[str] = []
             citations: list[str] = []
+            original_explanation = None
             try:
-                explained, explain_retries = _explain(
+                explained, explain_retries, explain_model = _explain(
                     client,
                     resolved_model,
                     expense,
+                    expenses,
                     policy_rules,
                     interpreted["label"],
+                    on_retry=lambda payload: _emit(
+                        audit, run_id, expense.report_id, "retry", payload
+                    ),
                 )
                 output.retries.extend(explain_retries)
+                original_explanation = (explained.get("message") or {}).get("content")
                 stated, citations, explanation_status = _parse_explanation(explained)
+                _emit(
+                    audit,
+                    run_id,
+                    expense.report_id,
+                    "explanation_observed",
+                    {
+                        "original_text": original_explanation,
+                        "explanation_status": explanation_status,
+                        "stated_justification": stated,
+                        "citations": citations,
+                        "response_model": explain_model,
+                        "provider": "openai",
+                        "requested_model": resolved_model,
+                    },
+                )
+            except AuditWriteError:
+                raise
             except Exception as exc:
                 explanation_status = "invalid"
-                output.errors.append(
-                    {
-                        "report_id": expense.report_id,
-                        "output_status": "explanation_invalid",
-                        "error": _redact(str(exc)),
-                    }
-                )
+                failure = {
+                    "report_id": expense.report_id,
+                    "output_status": "explanation_invalid",
+                    "error": _redact(str(exc)),
+                }
+                output.errors.append(failure)
+                _emit(audit, run_id, expense.report_id, "error", failure)
 
-            complete = citations_are_complete(citations, clause_ids) and explanation_status == "ok"
-            output.assessments.append(
-                _assessment(
-                    expense.report_id,
-                    resolved_model,
-                    settings,
-                    interpreted,
-                    stated_justification=stated,
-                    citations=citations,
-                    citations_complete=complete,
-                    explanation_status=explanation_status,
-                )
+            coverage = citation_coverage(citations, applicable_clause_ids(expense, policy_rules))
+            complete = coverage["complete"] and explanation_status == "ok"
+            assessment = _assessment(
+                expense.report_id,
+                resolved_model,
+                settings,
+                interpreted,
+                stated_justification=stated,
+                citations=citations,
+                citations_complete=complete,
+                citation_coverage=coverage,
+                explanation_status=explanation_status,
+                original_text=original_explanation,
+                facts_received=facts,
+                response_model=response_model,
             )
+            _emit(audit, run_id, expense.report_id, "ai_stated_output", assessment)
+            output.assessments.append(assessment)
             output.verdicts.append(
                 ExpenseVerdict(
                     report_id=expense.report_id,
@@ -317,7 +498,11 @@ def _assessment(
     stated_justification: list[str],
     citations: list[str],
     citations_complete: bool,
+    citation_coverage: Optional[dict] = None,
     explanation_status: str,
+    original_text=None,
+    facts_received: Optional[dict] = None,
+    response_model: Optional[str] = None,
 ) -> dict:
     return {
         "kind": "model_stated_output",
@@ -327,8 +512,13 @@ def _assessment(
         "stated_justification": stated_justification,
         "citations": citations,
         "citations_complete": citations_complete,
+        "citation_coverage": citation_coverage,
+        "original_text": original_text if original_text is not None else interpreted.get("raw_content"),
+        "facts_received": facts_received,
+        "label_mapping": dict(LABEL_MAP),
         "provider": "openai",
-        "model": model,
+        "model": response_model or model,
+        "requested_model": model,
         "prompt_version": PROMPT_VERSION,
         "settings": settings,
         "output_status": interpreted.get("output_status"),
@@ -349,41 +539,45 @@ def _alternatives(top_logprobs: list) -> list[dict]:
     for item in top_logprobs:
         if not isinstance(item, dict):
             continue
-        logprob = item.get("logprob")
-        if "token" not in item or not isinstance(logprob, (int, float)):
+        accepted, _reason = _accepted_logprob(item.get("logprob"))
+        if "token" not in item or accepted is None:
             continue
         alternatives.append(
             {
                 "token": item["token"],
-                "logprob": float(logprob),
-                "probability": probability_from_logprob(float(logprob)),
+                "logprob": accepted,
+                "probability": probability_from_logprob(accepted),
             }
         )
     return alternatives
 
 
-def _classify(client, model: str, expense: Expense, policy_rules: PolicyRules):
+def _classify(client, model, expense, expenses, policy_rules, max_tokens, on_retry=None):
     payload = {
         "model": model,
         "temperature": 0,
-        "max_tokens": CLASSIFY_MAX_TOKENS,
+        "max_tokens": max_tokens,
         "logprobs": True,
         "top_logprobs": TOP_LOGPROBS,
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "Classify this one expense. Reply with exactly one label token: "
-                    "approved or flagged. Do not add any other text."
+                    "Classify this expense using the daily context. "
+                    "Reply with exactly one label: A or B. "
+                    "A means approved. B means flagged. Do not add any other text."
                 ),
             },
-            {"role": "user", "content": _expense_prompt(expense, policy_rules)},
+            {
+                "role": "user",
+                "content": _expense_prompt(expense, expenses, policy_rules),
+            },
         ],
     }
-    return _post_chat(client, payload, expense.report_id, "classify")
+    return _post_chat(client, payload, expense.report_id, "classify", on_retry)
 
 
-def _explain(client, model: str, expense: Expense, policy_rules: PolicyRules, label: str):
+def _explain(client, model, expense, expenses, policy_rules, label, on_retry=None):
     payload = {
         "model": model,
         "temperature": 0,
@@ -395,24 +589,27 @@ def _explain(client, model: str, expense: Expense, policy_rules: PolicyRules, la
                 "content": (
                     "The classification label is already decided. Explain that label. "
                     "Return JSON with keys reasons and rule_citations. "
-                    "Do not output a replacement label."
+                    "Cite every clause that applies to this expense's category. "
+                    "Do not invent a citation and do not output a replacement label."
                 ),
             },
             {
                 "role": "user",
                 "content": (
                     f"Decided label: {label}\n"
-                    f"{_expense_prompt(expense, policy_rules)}\n"
+                    f"{_expense_prompt(expense, expenses, policy_rules)}\n"
                     'Return {"reasons": ["..."], "rule_citations": ["category.clause"]}'
                 ),
             },
         ],
     }
-    body, retries = _post_chat(client, payload, expense.report_id, "explain")
-    return body, retries
+    choice, retries, response_model = _post_chat(
+        client, payload, expense.report_id, "explain", on_retry
+    )
+    return choice, retries, response_model
 
 
-def _post_chat(client, payload: dict, report_id: str, call: str):
+def _post_chat(client, payload: dict, report_id: str, call: str, on_retry=None):
     retries = []
     attempt = 0
     while True:
@@ -424,19 +621,24 @@ def _post_chat(client, payload: dict, report_id: str, call: str):
             choice = (body.get("choices") or [None])[0]
             if not isinstance(choice, dict):
                 raise ValueError(f"OpenAI {call} response did not include a choice")
-            return choice, retries
+            return choice, retries, body.get("model")
+        except AuditWriteError:
+            raise
         except Exception as exc:
             retriable = attempt == 1 and _is_transient(exc)
-            retries.append(
-                {
-                    "report_id": report_id,
-                    "component": "openai_checker",
-                    "call": call,
-                    "attempt": attempt,
-                    "retried": retriable,
-                    "error": _redact(str(exc)),
-                }
-            )
+            record = {
+                "report_id": report_id,
+                "component": "openai_checker",
+                "call": call,
+                "attempt": attempt,
+                "retried": retriable,
+                "requested_model": payload.get("model"),
+                "endpoint": "/chat/completions",
+                "error": _redact(str(exc)),
+            }
+            retries.append(record)
+            if on_retry is not None:
+                on_retry(record)
             if not retriable:
                 raise
 
@@ -463,7 +665,15 @@ def _parse_explanation(choice: dict) -> tuple[list[str], list[str], str]:
     return reasons, citations, "ok"
 
 
-def _expense_prompt(expense: Expense, policy_rules: PolicyRules) -> str:
+def _emit(audit, run_id, expense_id, event_type: str, payload: dict) -> None:
+    if audit is None:
+        return
+    if not run_id:
+        raise AuditWriteError("A decision-log write requires a run id")
+    audit.append_event(run_id, expense_id, "checker", event_type, payload)
+
+
+def _expense_prompt(expense: Expense, expenses: list[Expense], policy_rules: PolicyRules) -> str:
     lines = [
         f"report_id: {expense.report_id}",
         f"employee: {expense.employee}",
@@ -474,9 +684,15 @@ def _expense_prompt(expense: Expense, policy_rules: PolicyRules) -> str:
         f"currency: {expense.currency}",
         f"receipt_attached: {expense.receipt_attached}",
         f"notes: {expense.notes or ''}",
-        "Policy thresholds:",
+        render_daily_context(
+            [item for item in expenses if daily_group_key(item) == daily_group_key(expense)]
+        ),
+        "Policy thresholds for this category:",
     ]
+    category_key = daily_group_key(expense)[2]
     for category, rule in policy_rules.rules.items():
+        if normalize_category(category) != category_key:
+            continue
         lines.append(
             f"- {category}: daily_limit {rule.daily_limit}; "
             f"receipt_required_above {rule.receipt_required_above}"

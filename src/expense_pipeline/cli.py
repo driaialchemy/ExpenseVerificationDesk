@@ -23,7 +23,12 @@ from .audit import (
     log_snowflake_load,
     log_run_summary,
 )
-from .decision_builder import build_final_decision, expense_snapshot
+from .decision_builder import (
+    build_final_decision,
+    expense_snapshot,
+    model_input_facts,
+    policy_snapshot_for,
+)
 from .decision_store import DecisionStore
 from .decision_view import decision_log_path
 from .openai_checker import CheckerOutputError
@@ -161,17 +166,18 @@ def run_pipeline(args):
 
         # Stage 3: LLM-assisted checking
         print(f"Stage 3: Running compliance checks ({provider})...")
+        persist_pre_inference_snapshots(store, run_id, expense_sheet.expenses, policy_rules)
         try:
             checker_output = check_compliance(
                 expense_sheet.expenses,
                 policy_rules,
                 model=args.model,
                 provider=provider,
+                audit=store,
+                run_id=run_id,
             )
-        except CheckerOutputError as exc:
-            _persist_checker_output(store, run_id, exc.partial)
+        except CheckerOutputError:
             raise
-        _persist_checker_output(store, run_id, checker_output)
         log_stage_completion(
             audit_file,
             "checker",
@@ -426,6 +432,22 @@ def _write_reports(report_dir: Path, run_result: RunResult) -> None:
         writer.writerow(["disagreements", len(run_result.disagreements)])
 
 
+def persist_pre_inference_snapshots(store: DecisionStore, run_id: str, expenses, policy_rules: PolicyRules) -> None:
+    """Write input and policy snapshots before any model call. A failed write stops the run."""
+    for expense in expenses:
+        store.append_event(
+            run_id,
+            expense.report_id,
+            "checker",
+            "pre_inference_snapshot",
+            {
+                "input_facts": expense_snapshot(expense),
+                "policy_snapshot": policy_snapshot_for(expense, policy_rules),
+                "facts_received": model_input_facts(expense, expenses),
+            },
+        )
+
+
 def finalize_and_maybe_load(store: DecisionStore, records: list[dict], *, load, do_load: bool):
     """Write every final decision before any downstream load. A failed write stops the load."""
     for record in records:
@@ -485,46 +507,6 @@ def _decision_records(
             )
         )
     return records
-
-
-def _persist_checker_output(store: DecisionStore, run_id: str, output: CheckerOutput) -> None:
-    for retry in output.retries:
-        store.append_event(
-            run_id,
-            retry.get("report_id"),
-            "checker",
-            "retry",
-            retry,
-        )
-    for error in output.errors:
-        store.append_event(
-            run_id,
-            error.get("report_id"),
-            "checker",
-            "error",
-            error,
-        )
-    for assessment in output.assessments:
-        store.append_event(
-            run_id,
-            assessment.get("report_id"),
-            "checker",
-            "ai_stated_output",
-            {
-                "kind": "model_stated_output",
-                "verdict": assessment.get("verdict"),
-                "stated_justification": assessment.get("stated_justification"),
-                "citations": assessment.get("citations"),
-                "citations_complete": assessment.get("citations_complete"),
-                "provider": assessment.get("provider"),
-                "model": assessment.get("model"),
-                "prompt_version": assessment.get("prompt_version"),
-                "output_status": assessment.get("output_status"),
-                "label_probability": assessment.get("label_probability"),
-                "probability_unavailable_reason": assessment.get("probability_unavailable_reason"),
-                "note": assessment.get("note"),
-            },
-        )
 
 
 if __name__ == "__main__":

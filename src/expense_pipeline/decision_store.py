@@ -36,6 +36,7 @@ _CONTENT_FIELDS = (
     "disagreement",
     "final_outcome",
     "reconciliation_rule",
+    "reconciliation_explanation",
     "errors",
     "retries",
     "human_review",
@@ -152,6 +153,8 @@ def validate_decision_record(record: dict, *, final: bool) -> None:
             raise AuditWriteError("Final decision is missing a valid outcome")
         if not record.get("reconciliation_rule"):
             raise AuditWriteError("Final decision is missing the reconciliation rule")
+        if not record.get("reconciliation_explanation"):
+            raise AuditWriteError("Final decision does not explain the reconciliation rule")
         if not isinstance(ai, dict):
             raise AuditWriteError("Complete decision is missing the AI assessment")
         for key in ("decision_id", "version", "created_at", "updated_at"):
@@ -417,6 +420,9 @@ class DecisionStore:
         revised["human_review"] = review
         revised["final_outcome"] = outcome
         revised["reconciliation_rule"] = reconciliation_rule
+        from .approver import explain_reconciliation
+
+        revised["reconciliation_explanation"] = explain_reconciliation(reconciliation_rule)
         revised["responsible_component"] = "human_reviewer"
         revised["overrides"] = list(latest.get("overrides") or []) + [
             {
