@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .schemas import (
@@ -186,9 +186,11 @@ def gate_snowflake_load_verified(
 
 
 def log_gate_failure(audit_file: Path, failure: GateFailure) -> None:
-    """Log a gate failure to the audit JSON file."""
+    """Log a gate failure to the audit JSON file. Failure blocks the caller."""
+    from .audit import AuditWriteError
+
     audit_entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "type": "gate_failure",
         "stage": failure.stage,
         "reason": failure.reason,
@@ -197,14 +199,14 @@ def log_gate_failure(audit_file: Path, failure: GateFailure) -> None:
 
     try:
         if audit_file.exists():
-            with open(audit_file, "r") as f:
-                audit_log = json.load(f)
+            with open(audit_file, "r", encoding="utf-8") as handle:
+                audit_log = json.load(handle)
         else:
             audit_log = []
 
         audit_log.append(audit_entry)
 
-        with open(audit_file, "w") as f:
-            json.dump(audit_log, f, indent=2)
-    except Exception as e:
-        print(f"Warning: Failed to log gate failure: {e}")
+        with open(audit_file, "w", encoding="utf-8") as handle:
+            json.dump(audit_log, handle, indent=2)
+    except Exception as exc:
+        raise AuditWriteError(f"Failed to log gate failure: {exc}") from exc

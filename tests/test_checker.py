@@ -86,6 +86,12 @@ def test_check_compliance_basic(mock_anthropic_class):
     assert output.verdicts[0].report_id == "EXP-0001"
     assert output.verdicts[0].verdict == "approved"
     assert output.verdicts[1].verdict == "flagged"
+    assert output.assessments[0]["citations_complete"] is False
+    assert output.assessments[1]["citations_complete"] is False
+    assert "meals.daily_limit" in output.assessments[1]["citation_coverage"]["missing"]
+    assert output.assessments[1]["citations"] == ["meals.receipt_required_above"]
+    assert output.assessments[0]["kind"] == "model_stated_output"
+    assert output.assessments[0]["label_probability"] is None
 
 
 @patch("src.expense_pipeline.checker.Anthropic")
@@ -167,6 +173,58 @@ def test_check_compliance_invalid_json(mock_anthropic_class):
         check_compliance(expenses, policy)
 
     assert "Failed to parse" in str(exc_info.value)
+
+
+@patch("src.expense_pipeline.checker.Anthropic")
+def test_checker_receives_same_day_context_without_verifier_output(mock_anthropic_class):
+    """Two lines that are each under the limit are both shown before the model answers."""
+    expenses = [
+        Expense(
+            report_id="EXP-0001",
+            employee="Alice",
+            department="Engineering",
+            date="2024-01-15",
+            category="meals",
+            amount=40.00,
+            currency="USD",
+            receipt_attached=True,
+        ),
+        Expense(
+            report_id="EXP-0002",
+            employee="Alice",
+            department="Engineering",
+            date="2024-01-15",
+            category="meals",
+            amount=40.00,
+            currency="USD",
+            receipt_attached=True,
+        ),
+    ]
+    policy = create_test_policy()
+    payload = [
+        {
+            "report_id": report_id,
+            "verdict": "approved",
+            "reasons": ["Each line is under 75."],
+            "rule_citations": ["meals.daily_limit", "meals.receipt_required_above"],
+        }
+        for report_id in ("EXP-0001", "EXP-0002")
+    ]
+    mock_client = Mock()
+    mock_anthropic_class.return_value = mock_client
+    mock_client.messages.create.return_value = Mock(content=[Mock(text=json.dumps(payload))])
+
+    output = check_compliance(expenses, policy, model="claude-haiku-4-5")
+
+    prompt = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "Daily context" in prompt
+    assert "EXP-0001" in prompt and "EXP-0002" in prompt
+    assert "40.0" in prompt
+    assert "verifier_verdict" not in prompt
+    received = output.assessments[0]["facts_received"]["rows"]
+    assert {row["report_id"] for row in received} == {"EXP-0001", "EXP-0002"}
+    assert output.assessments[0]["citations_complete"] is True
+    assert output.assessments[0]["original_text"]
 
 
 def test_resolve_model_default(monkeypatch):

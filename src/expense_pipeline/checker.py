@@ -9,8 +9,21 @@ from typing import Optional
 import httpx
 from anthropic import Anthropic
 
+from .audit import AuditWriteError
+from .decision_builder import (
+    applicable_clause_ids,
+    citation_coverage,
+    model_input_facts,
+    render_daily_context,
+)
 from .schemas import Expense, PolicyRules, ExpenseVerdict, CheckerOutput
 from .gates import gate_checker, GateFailure
+
+ANTHROPIC_PROMPT_VERSION = "anthropic-json-batch-v2"
+AI_NOTE = (
+    "stated_justification is text the model produced. "
+    "It is not an observation of the model's internal reasoning."
+)
 
 
 class AnthropicConnectionError(ValueError):
@@ -43,6 +56,15 @@ def resolve_model(model: Optional[str] = None) -> str:
     return configured.strip() if configured else DEFAULT_MODEL
 
 
+def resolve_provider(provider: Optional[str] = None) -> str:
+    """Resolve the checker provider. Anthropic remains the default."""
+    raw = provider if provider else os.environ.get("EXPENSE_CHECKER_PROVIDER", "anthropic")
+    value = (raw or "anthropic").strip().lower()
+    if value not in {"anthropic", "openai"}:
+        raise ValueError("Checker provider must be 'anthropic' or 'openai'")
+    return value
+
+
 def _env_api_key() -> Optional[str]:
     raw = os.environ.get("ANTHROPIC_API_KEY")
     if raw is None:
@@ -66,22 +88,55 @@ def check_compliance(
     expenses: list[Expense],
     policy_rules: PolicyRules,
     model: Optional[str] = None,
+    provider: Optional[str] = None,
+    audit=None,
+    run_id: Optional[str] = None,
 ) -> CheckerOutput:
     """
     Use LLM to perform compliance judgment on ambiguous expense rows.
 
     Returns verdict for each expense based on policy rules.
     Gate confirms row-count parity and every row has a verdict.
+    OpenAI mode records label probabilities and does not use them as a threshold.
     """
+    resolved_provider = resolve_provider(provider)
+    if resolved_provider == "openai":
+        from .openai_checker import check_compliance_openai
+
+        return check_compliance_openai(
+            expenses,
+            policy_rules,
+            model=model,
+            audit=audit,
+            run_id=run_id,
+        )
+
     resolved_model = resolve_model(model)
     try:
-        return _run_checker(_build_client(), expenses, policy_rules, resolved_model)
+        return _run_checker(
+            _build_client(),
+            expenses,
+            policy_rules,
+            resolved_model,
+            audit=audit,
+            run_id=run_id,
+        )
     except Exception as exc:
+        if isinstance(exc, AuditWriteError):
+            raise
         if _is_illegal_api_key_header(exc):
             raise AnthropicConnectionError(_illegal_api_key_message()) from exc
         if _is_model_not_found(exc) or not _is_connection_error(exc):
             raise
         print("  [WARN] Default network path failed; retrying over IPv4...")
+        retry = {
+            "component": "checker",
+            "provider": "anthropic",
+            "action": "retry_over_ipv4",
+            "attempted_model": resolved_model,
+            "error": _redact_secrets(_exception_chain(exc)),
+        }
+        _emit_audit(audit, run_id, None, "retry", retry)
         ipv4_client = _build_client(
             http_client=httpx.Client(
                 timeout=120.0,
@@ -89,11 +144,20 @@ def check_compliance(
             ),
         )
         try:
-            return _run_checker(ipv4_client, expenses, policy_rules, resolved_model)
+            output = _run_checker(
+                ipv4_client,
+                expenses,
+                policy_rules,
+                resolved_model,
+                audit=audit,
+                run_id=run_id,
+            )
         except Exception as retry_exc:
             if _is_connection_error(retry_exc):
                 raise AnthropicConnectionError(_connection_error_message(retry_exc)) from retry_exc
             raise
+        output.retries = [retry, *output.retries]
+        return output
 
 
 def _run_checker(
@@ -101,6 +165,8 @@ def _run_checker(
     expenses: list[Expense],
     policy_rules: PolicyRules,
     model: str,
+    audit=None,
+    run_id: Optional[str] = None,
 ) -> CheckerOutput:
     policy_summary = _build_policy_summary(policy_rules)
     expenses_text = _build_expenses_text(expenses)
@@ -115,30 +181,58 @@ Respond with a JSON array of verdicts. Each verdict should follow this schema:
   "report_id": "EXP-XXXX",
   "verdict": "approved" or "flagged",
   "reasons": ["reason1", "reason2"],
-  "rule_citations": ["policy.rule"]
+  "rule_citations": ["meals.daily_limit", "meals.receipt_required_above"]
 }}
 
+rule_citations must name every policy clause that applies to that expense's category.
+If you cannot cite a clause, leave it out. Do not invent a citation.
+
+For each expense, use the daily context below. A daily limit is the total for the same employee, calendar day, category, and currency. Do not convert currencies.
+
 For each expense, check:
-1. Amount does not exceed daily category limit
+1. The daily total does not exceed the category daily limit
 2. Receipt requirement met (if amount over threshold, receipt must be attached)
 3. Manager approval requirement met (if software/client_entertainment over threshold, needs approval)
 
 Be conservative: flag any ambiguous cases for human review in reasons."""
 
+    daily_context = render_daily_context(expenses)
     expenses_prompt = f"""Please review these expenses for policy compliance:
 
 {expenses_text}
 
+{daily_context}
+
 Return a JSON array with one verdict per expense, in the same order."""
 
-    response = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=4096,
+    settings = {"max_tokens": 4096, "temperature": None}
+    _emit_audit(
+        audit,
+        run_id,
+        None,
+        "request_started",
+        {
+            "provider": "anthropic",
+            "requested_model": model,
+            "prompt_version": ANTHROPIC_PROMPT_VERSION,
+            "settings": settings,
+            "prompt_row_ids": [expense.report_id for expense in expenses],
+            "facts_received": [
+                model_input_facts(expense, expenses) for expense in expenses
+            ],
+        },
+    )
+    response, model_used, retries = _create_message(
+        client,
+        model,
+        max_tokens=settings["max_tokens"],
         system=system_prompt,
         messages=[{"role": "user", "content": expenses_prompt}],
     )
 
     response_text = response.content[0].text
+    for retry in retries:
+        _emit_audit(audit, run_id, None, "retry", retry)
 
     try:
         json_start = response_text.find("[")
@@ -146,6 +240,17 @@ Return a JSON array with one verdict per expense, in the same order."""
         json_str = response_text[json_start:json_end]
         verdicts_data = json.loads(json_str)
     except (json.JSONDecodeError, ValueError) as e:
+        _emit_audit(
+            audit,
+            run_id,
+            None,
+            "error",
+            {
+                "output_status": "invalid",
+                "error": f"Failed to parse LLM response: {e}",
+                "original_text": response_text,
+            },
+        )
         raise ValueError(f"Failed to parse LLM response: {e}\n\nResponse: {response_text}")
 
     verdicts = []
@@ -161,7 +266,49 @@ Return a JSON array with one verdict per expense, in the same order."""
         except KeyError as e:
             raise ValueError(f"Missing field in verdict: {e}")
 
-    output = CheckerOutput(verdicts=verdicts)
+    expenses_by_id = {expense.report_id: expense for expense in expenses}
+    assessments = []
+    for verdict in verdicts:
+        expense = expenses_by_id.get(verdict.report_id)
+        applicable = applicable_clause_ids(expense, policy_rules) if expense else []
+        citations = list(verdict.rule_citations)
+        coverage = citation_coverage(citations, applicable)
+        assessment = {
+            "kind": "model_stated_output",
+            "note": AI_NOTE,
+            "report_id": verdict.report_id,
+            "verdict": verdict.verdict,
+            "stated_justification": list(verdict.reasons),
+            "citations": citations,
+            "citations_complete": coverage["complete"],
+            "citation_coverage": coverage,
+            "original_text": response_text,
+            "facts_received": {
+                **(model_input_facts(expense, expenses) if expense else {}),
+                "prompt_row_ids": [item.report_id for item in expenses],
+            },
+            "provider": "anthropic",
+            "model": model_used,
+            "prompt_version": ANTHROPIC_PROMPT_VERSION,
+            "settings": settings,
+            "output_status": "ok",
+            "label_logprob": None,
+            "label_probability": None,
+            "probability_unavailable_reason": "provider_does_not_return_label_logprobs",
+            "alternatives": [],
+        }
+        _emit_audit(audit, run_id, verdict.report_id, "ai_stated_output", assessment)
+        assessments.append(assessment)
+
+    output = CheckerOutput(
+        verdicts=verdicts,
+        provider="anthropic",
+        model=model_used,
+        prompt_version=ANTHROPIC_PROMPT_VERSION,
+        settings=settings,
+        assessments=assessments,
+        retries=retries,
+    )
 
     # Gate: confirm row count parity and all rows have verdicts
     try:
@@ -173,17 +320,25 @@ Return a JSON array with one verdict per expense, in the same order."""
 
 
 def _create_message(client: Anthropic, model: str, **kwargs):
-    """Call Messages API, falling back to a model this API key can access."""
+    """Call Messages API with the requested model, falling back only on a 404."""
     try:
-        return client.messages.create(model=model, **kwargs)
+        return client.messages.create(model=model, **kwargs), model, []
     except Exception as exc:
         if not _is_model_not_found(exc):
             raise
         available = _list_available_models(client)
         fallback = _pick_available_model(available, exclude=model)
+        retry = {
+            "component": "checker",
+            "provider": "anthropic",
+            "action": "model_fallback" if fallback else "model_unavailable",
+            "attempted_model": model,
+            "fallback_model": fallback,
+            "error": _redact_secrets(str(exc)),
+        }
         if fallback:
             print(f"  [WARN] Model '{model}' is not available; using '{fallback}'")
-            return client.messages.create(model=fallback, **kwargs)
+            return client.messages.create(model=fallback, **kwargs), fallback, [retry]
         raise ValueError(_model_not_found_message(model, available)) from exc
 
 
@@ -286,6 +441,14 @@ def _build_policy_summary(policy_rules: PolicyRules) -> str:
                 f"  Manager approval required if > ${rule.requires_manager_approval_above}"
             )
     return "\n".join(lines)
+
+
+def _emit_audit(audit, run_id: Optional[str], expense_id: Optional[str], event_type: str, payload: dict) -> None:
+    if audit is None:
+        return
+    if not run_id:
+        raise AuditWriteError("A decision-log write requires a run id")
+    audit.append_event(run_id, expense_id, "checker", event_type, payload)
 
 
 def _build_expenses_text(expenses: list[Expense]) -> str:

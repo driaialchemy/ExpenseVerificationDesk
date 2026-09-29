@@ -1,8 +1,8 @@
 # Expense Verification Pipeline - Build Summary
 
-## ✓ Build Complete
+## Prototype status
 
-All components of the expense-verification-pipeline have been successfully built and tested.
+The pipeline, decision log, and dashboard view are implemented and covered by local tests. This is not a production certification, and the tests are not an accuracy measurement.
 
 ### Repository Structure
 
@@ -11,12 +11,16 @@ expense-verification-pipeline/
 ├── src/expense_pipeline/
 │   ├── __init__.py
 │   ├── cli.py                    # CLI entry point
-│   ├── schemas.py                # Data models (15 dataclasses)
+│   ├── schemas.py                # Data models
 │   ├── ingestion.py              # Stage 1: Excel parsing
 │   ├── policy_parser.py          # Stage 2: DOCX policy extraction
-│   ├── checker.py                # Stage 3: LLM-assisted checking
+│   ├── checker.py                # Stage 3: Anthropic checking
+│   ├── openai_checker.py         # Stage 3: optional OpenAI A/B mode
 │   ├── verifier.py               # Stage 4: Pure code verification
 │   ├── approver.py               # Stage 5: Verdict reconciliation
+│   ├── decision_store.py         # Versioned SQLite decision log
+│   ├── decision_builder.py       # Decision record assembly
+│   ├── decision_view.py          # Stored decision view
 │   ├── snowflake_loader.py       # Stage 6: Snowflake write
 │   ├── gates.py                  # Gate checks (6 gates)
 │   ├── audit.py                  # Audit trail logging
@@ -25,13 +29,15 @@ expense-verification-pipeline/
 │       ├── app.py                # Streamlit dashboard
 │       └── queries.py            # SQL queries (8 queries)
 ├── tests/
-│   ├── test_ingestion.py         # 4 tests
-│   ├── test_policy_parser.py     # 4 tests
-│   ├── test_checker.py           # 4 tests
-│   ├── test_verifier.py          # 6 tests
-│   ├── test_gates.py             # 4 tests
-│   ├── test_snowflake_loader.py  # 6 tests
-│   └── test_end_to_end.py        # 3 tests
+│   ├── test_ingestion.py
+│   ├── test_policy_parser.py
+│   ├── test_checker.py
+│   ├── test_openai_checker.py
+│   ├── test_verifier.py
+│   ├── test_gates.py
+│   ├── test_snowflake_loader.py
+│   ├── test_decision_process.py
+│   └── test_end_to_end.py
 ├── sql/
 │   └── 001_create_tables.sql     # Schema DDL
 ├── pyproject.toml                # Package config
@@ -43,15 +49,7 @@ expense-verification-pipeline/
 
 ### Test Results
 
-✓ **31 tests passing** (100% success rate)
-
-- Ingestion tests: 4/4 passing
-- Policy parser tests: 4/4 passing
-- Checker tests: 4/4 passing
-- Verifier tests: 6/6 passing
-- Gates tests: 4/4 passing
-- Snowflake loader tests: 6/6 passing
-- End-to-end tests: 3/3 passing
+Local `pytest` covers ingestion, policy parsing, the checker (including the configured model id and same-day input rows), the verifier, gates, the Snowflake loader with mocks, end-to-end temp files, the decision log, OpenAI A/B logprob handling with a fake client, citation coverage, and a midway audit-write failure. On 2026-09-28 that mocked suite was 77 passed. Re-run `pytest tests/ -q` for the current count. No live model or Snowflake call is part of that suite.
 
 ### Verified Features
 
@@ -78,6 +76,8 @@ expense-verification-pipeline/
 - [x] Department breakdown charts
 - [x] Category breakdown charts
 - [x] Needs-review callout section
+- [x] View decision process reads the local decision log and does not call a model
+- [x] Incomplete and legacy records are labeled
 - [x] SQL query abstraction layer
 
 #### CLI
@@ -86,12 +86,39 @@ expense-verification-pipeline/
 - [x] CSV report output
 - [x] Stage-by-stage logging
 
+#### Decision log
+- [x] Versioned SQLite record per expense: ids, timestamps, source row, input and policy snapshots, applied clauses, model-stated output, verifier checks, disagreement, reconciliation rule, errors, and retries
+- [x] Append-only events; a later recorded human review keeps the earlier version
+- [x] Mandatory audit-write failure blocks finalization and Snowflake loading
+- [x] CSV export keeps the original columns and appends reasons plus the reconciliation rule
+- [x] `audit/`, `reports/`, and SQLite files are gitignored
+
+#### OpenAI observation mode
+- [x] Anthropic remains the default checker
+- [x] OpenAI mode classifies with short labels `A` (approved) and `B` (flagged), then requests a separate explanation
+- [x] A score is stored only after tiktoken confirms the returned label is one token for the configured model
+- [x] The score is `exp(logprob)` of that token; positive, non-finite, and malformed logprobs stay null
+- [x] `flagged` is not scored as a word; on `gpt-4o-mini` / `o200k_base` it is two tokens
+- [x] Classification is written before the explanation call
+- [x] Invalid labels, refusals, truncation, and missing scores are explicit
+- [x] Probabilities do not change the approver
+
+#### Daily limit
+- [x] Same employee, calendar day, category, and currency are summed
+- [x] Different currencies are not converted or added together
+- [x] Receipt and manager-approval checks stay per line
+- [x] Applied clauses are cited on pass and fail
+- [x] Both checkers receive the same-employee/day/category/currency input rows, and the assessment records those rows
+- [x] Checker citation coverage is complete only when every applicable clause for that expense is cited and no extra citation is present
+- [x] The model's original text is kept; missing citations are not invented
+
 #### Safety & Design
 - [x] No secrets in git (.env gitignored)
 - [x] Verifier is pure code (no LLM/network)
 - [x] Gates check artifacts, not status flags
 - [x] Snowflake writes are additive (tagged by run_id)
-- [x] Comprehensive error handling
+- [x] Model id from `--model` or `ANTHROPIC_MODEL` is sent to the checker
+- [x] Audit write failures are raised instead of printed and ignored
 
 ### Real Data Tested
 
@@ -131,15 +158,15 @@ streamlit run src/expense_pipeline/dashboard/app.py
 2. **Python 3.11+**: Requires Python 3.11 or later
 3. **Character Encoding**: CLI uses ASCII-safe output for Windows compatibility
 4. **Policy Parser**: Improved to handle real Word documents with flexible table parsing
-5. **All tests mocked**: Snowflake and Anthropic calls are mocked in unit tests
+5. **Mocked tests are not live tests**: Snowflake, Anthropic, and OpenAI calls are mocked. A live run still needs the provider key and, for Snowflake, the connection environment variables.
 
 ## What Was Built
 
-This is a production-ready, gated expense verification pipeline that demonstrates:
-- Multi-stage data processing with independent verification
-- Gate-based quality assurance (artifacts, not status strings)
-- Comprehensive audit trails
-- Dual-mode dashboard (Streamlit + Snowflake-native)
-- Extensible CLI with clear separation of concerns
+This prototype demonstrates:
+- Multi-stage expense checks with an independent verifier
+- Gate checks on artifacts
+- A versioned local decision log
+- A dashboard that can show the stored decision process
+- An optional OpenAI label-probability mode that scores A/B and does not change approvals
 
-The codebase is ready for deployment and further integration with production systems.
+It is not a claim that the prototype is ready for production, and it is not a measurement of how often the verdicts would match a human reviewer.

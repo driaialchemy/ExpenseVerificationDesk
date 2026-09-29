@@ -10,7 +10,7 @@ import uuid
 
 from .ingestion import ingest_expenses
 from .policy_parser import parse_policy_manual
-from .checker import check_compliance
+from .checker import check_compliance, resolve_provider
 from .verifier import verify_compliance
 from .approver import approve_expenses
 from .snowflake_loader import load_to_snowflake
@@ -23,7 +23,16 @@ from .audit import (
     log_snowflake_load,
     log_run_summary,
 )
-from .schemas import RunResult
+from .decision_builder import (
+    build_final_decision,
+    expense_snapshot,
+    model_input_facts,
+    policy_snapshot_for,
+)
+from .decision_store import DecisionStore
+from .decision_view import decision_log_path
+from .openai_checker import CheckerOutputError
+from .schemas import ApprovedExpense, CheckerOutput, PolicyRules, RunResult
 
 
 def _load_dotenv() -> None:
@@ -76,6 +85,17 @@ def main():
         default="reports",
         help="Directory for report CSV files",
     )
+    run_parser.add_argument(
+        "--model",
+        default=None,
+        help="Checker model id. Overrides ANTHROPIC_MODEL or OPENAI_MODEL.",
+    )
+    run_parser.add_argument(
+        "--checker-provider",
+        default=None,
+        choices=["anthropic", "openai"],
+        help="Checker provider. Default is anthropic. OpenAI mode records label probabilities only.",
+    )
     run_parser.set_defaults(func=run_pipeline)
 
     args = parser.parse_args()
@@ -96,10 +116,12 @@ def run_pipeline(args):
     run_id = str(uuid.uuid4())[:8]
     print(f"Starting expense verification run: {run_id}")
 
-    # Setup audit trail
     audit_file = create_audit_file(args.audit_dir, run_id)
     report_dir = Path(args.reports_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
+    provider = resolve_provider(args.checker_provider)
+    store = DecisionStore(decision_log_path(args.audit_dir))
+    store.start_run(run_id, args.spreadsheet, args.policy, provider)
 
     try:
         # Stage 1: Ingest expenses
@@ -111,6 +133,14 @@ def run_pipeline(args):
             "success",
             {"rows": len(expense_sheet.expenses)},
         )
+        for expense in expense_sheet.expenses:
+            store.append_event(
+                run_id,
+                expense.report_id,
+                "ingestion",
+                "input_captured",
+                expense_snapshot(expense),
+            )
         print(f"  [OK] Loaded {len(expense_sheet.expenses)} expenses")
 
         # Stage 2: Parse policy
@@ -122,11 +152,32 @@ def run_pipeline(args):
             "success",
             {"categories": len(policy_rules.rules)},
         )
+        store.append_event(
+            run_id,
+            None,
+            "policy_parser",
+            "policy_snapshot_retained",
+            {
+                "source_file": policy_rules.source_file,
+                "categories": list(policy_rules.rules.keys()),
+            },
+        )
         print(f"  [OK] Parsed {len(policy_rules.rules)} policy categories")
 
         # Stage 3: LLM-assisted checking
-        print("Stage 3: Running compliance checks...")
-        checker_output = check_compliance(expense_sheet.expenses, policy_rules)
+        print(f"Stage 3: Running compliance checks ({provider})...")
+        persist_pre_inference_snapshots(store, run_id, expense_sheet.expenses, policy_rules)
+        try:
+            checker_output = check_compliance(
+                expense_sheet.expenses,
+                policy_rules,
+                model=args.model,
+                provider=provider,
+                audit=store,
+                run_id=run_id,
+            )
+        except CheckerOutputError:
+            raise
         log_stage_completion(
             audit_file,
             "checker",
@@ -134,9 +185,15 @@ def run_pipeline(args):
             {
                 "verdicts": len(checker_output.verdicts),
                 "flagged": sum(1 for v in checker_output.verdicts if v.verdict == "flagged"),
+                "provider": checker_output.provider,
+                "model": checker_output.model,
+                "prompt_version": checker_output.prompt_version,
             },
         )
-        print(f"  [OK] Generated {len(checker_output.verdicts)} verdicts")
+        print(
+            f"  [OK] Generated {len(checker_output.verdicts)} verdicts "
+            f"({checker_output.provider}/{checker_output.model})"
+        )
 
         # Stage 4: Independent verification
         print("Stage 4: Running independent verification...")
@@ -150,6 +207,19 @@ def run_pipeline(args):
                 "flagged": sum(1 for v in verifier_output.verdicts if v.verdict == "flagged"),
             },
         )
+        for verdict in verifier_output.verdicts:
+            store.append_event(
+                run_id,
+                verdict.report_id,
+                "verifier",
+                "checks_completed",
+                {
+                    "verdict": verdict.verdict,
+                    "reasons": list(verdict.reasons),
+                    "rule_citations": list(verdict.rule_citations),
+                    "checks": list(verdict.checks or []),
+                },
+            )
         print(f"  [OK] Verified {len(verifier_output.verdicts)} verdicts")
 
         # Stage 5: Approval and finalization
@@ -160,10 +230,38 @@ def run_pipeline(args):
             verifier_output.verdicts,
         )
 
+        for disagreement in disagreements:
+            store.append_event(
+                run_id,
+                disagreement.report_id,
+                "approver",
+                "disagreement",
+                {
+                    "checker_verdict": disagreement.checker_verdict,
+                    "verifier_verdict": disagreement.verifier_verdict,
+                    "match": disagreement.match,
+                },
+            )
+
+        records = _decision_records(
+            run_id,
+            policy_rules,
+            checker_output,
+            approved_expenses,
+            disagreements,
+        )
+        # Mandatory decision writes happen before reports are treated as final
+        # and before any Snowflake load.
+        finalize_and_maybe_load(
+            store,
+            records,
+            load=lambda: load_to_snowflake(run_id, approved_expenses),
+            do_load=False,
+        )
+
         for approved_exp in approved_expenses:
             verifier = approved_exp.verifier_verdict
             citations = list(verifier.rule_citations or [])
-            policy_matched = citations[0] if citations else None
             log_decision(
                 audit_file,
                 approved_exp.expense.report_id,
@@ -173,12 +271,10 @@ def run_pipeline(args):
                     f"verifier:{verifier.verdict}",
                     *(verifier.reasons or []),
                 ],
-                policy_matched=policy_matched,
-                confidence=(
-                    0.4
-                    if approved_exp.final_status == "needs_human_review"
-                    else 1.0
-                ),
+                policy_matched=citations[0] if citations else None,
+                confidence=None,
+                rule_citations=citations,
+                reconciliation_rule=approved_exp.reconciliation_rule,
             )
 
         for disagreement in disagreements:
@@ -225,6 +321,13 @@ def run_pipeline(args):
         # Stage 6: Optional Snowflake load
         if args.load_to_snowflake:
             print("Stage 6: Loading to Snowflake...")
+            store.append_event(
+                run_id,
+                None,
+                "loader",
+                "snowflake_load_starting",
+                {"rows": len(approved_expenses)},
+            )
             try:
                 rows_loaded, verified_count = load_to_snowflake(run_id, approved_expenses)
                 log_snowflake_load(
@@ -233,9 +336,23 @@ def run_pipeline(args):
                     verified_count,
                     rows_loaded == verified_count,
                 )
+                store.append_event(
+                    run_id,
+                    None,
+                    "loader",
+                    "snowflake_load_finished",
+                    {"rows_loaded": rows_loaded, "verified_count": verified_count},
+                )
                 print(f"  [OK] Loaded {rows_loaded} rows to Snowflake (verified: {verified_count})")
             except Exception as e:
                 log_snowflake_load(audit_file, 0, 0, False)
+                store.append_event(
+                    run_id,
+                    None,
+                    "loader",
+                    "snowflake_load_failed",
+                    {"error": str(e)},
+                )
                 print(f"  [ERROR] Snowflake load failed: {e}", file=sys.stderr)
                 raise
         else:
@@ -246,9 +363,11 @@ def run_pipeline(args):
         _write_reports(report_dir, run_result)
 
         log_run_summary(audit_file, run_result)
+        store.complete_run(run_id)
 
         print(f"\n[OK] Pipeline complete: {run_id}")
         print(f"  Audit trail: {audit_file}")
+        print(f"  Decision log: {store.path}")
         print(f"  Reports: {report_dir}")
 
     except Exception as e:
@@ -275,6 +394,9 @@ def _write_reports(report_dir: Path, run_result: RunResult) -> None:
                 "checker_verdict",
                 "verifier_verdict",
                 "final_status",
+                "checker_reasons",
+                "verifier_reasons",
+                "reconciliation_rule",
             ]
         )
         for approved_exp in run_result.approved_expenses:
@@ -289,6 +411,9 @@ def _write_reports(report_dir: Path, run_result: RunResult) -> None:
                     approved_exp.checker_verdict.verdict,
                     approved_exp.verifier_verdict.verdict,
                     approved_exp.final_status,
+                    "; ".join(approved_exp.checker_verdict.reasons),
+                    "; ".join(approved_exp.verifier_verdict.reasons),
+                    approved_exp.reconciliation_rule,
                 ]
             )
 
@@ -305,6 +430,83 @@ def _write_reports(report_dir: Path, run_result: RunResult) -> None:
         writer.writerow(["flagged", run_result.flagged_count])
         writer.writerow(["needs_review", run_result.needs_review_count])
         writer.writerow(["disagreements", len(run_result.disagreements)])
+
+
+def persist_pre_inference_snapshots(store: DecisionStore, run_id: str, expenses, policy_rules: PolicyRules) -> None:
+    """Write input and policy snapshots before any model call. A failed write stops the run."""
+    for expense in expenses:
+        store.append_event(
+            run_id,
+            expense.report_id,
+            "checker",
+            "pre_inference_snapshot",
+            {
+                "input_facts": expense_snapshot(expense),
+                "policy_snapshot": policy_snapshot_for(expense, policy_rules),
+                "facts_received": model_input_facts(expense, expenses),
+            },
+        )
+
+
+def finalize_and_maybe_load(store: DecisionStore, records: list[dict], *, load, do_load: bool):
+    """Write every final decision before any downstream load. A failed write stops the load."""
+    for record in records:
+        store.finalize_decision(record)
+    if do_load:
+        return load()
+    return None
+
+
+def _decision_records(
+    run_id: str,
+    policy_rules: PolicyRules,
+    checker_output: CheckerOutput,
+    approved_expenses: list[ApprovedExpense],
+    disagreements,
+) -> list[dict]:
+    assessments = {item["report_id"]: item for item in checker_output.assessments}
+    disagreement_ids = {item.report_id for item in disagreements}
+    records = []
+    for approved in approved_expenses:
+        expense = approved.expense
+        assessment = assessments.get(expense.report_id)
+        if assessment is None:
+            raise ValueError(f"Missing AI assessment for {expense.report_id}")
+        disagreement = None
+        if expense.report_id in disagreement_ids:
+            disagreement = {
+                "checker_verdict": approved.checker_verdict.verdict,
+                "verifier_verdict": approved.verifier_verdict.verdict,
+                "checker_reasons": list(approved.checker_verdict.reasons),
+                "verifier_reasons": list(approved.verifier_verdict.reasons),
+                "reason_sets_equal": set(approved.checker_verdict.reasons)
+                == set(approved.verifier_verdict.reasons),
+                "match": False,
+            }
+        records.append(
+            build_final_decision(
+                run_id=run_id,
+                expense=expense,
+                policy_rules=policy_rules,
+                assessment=assessment,
+                verifier_verdict=approved.verifier_verdict,
+                final_status=approved.final_status,
+                reconciliation_rule=approved.reconciliation_rule,
+                disagreement=disagreement,
+                errors=[
+                    error
+                    for error in checker_output.errors
+                    if error.get("report_id") in {None, expense.report_id}
+                ],
+                retries=[
+                    retry
+                    for retry in checker_output.retries
+                    if retry.get("report_id") in {None, expense.report_id}
+                    or "report_id" not in retry
+                ],
+            )
+        )
+    return records
 
 
 if __name__ == "__main__":

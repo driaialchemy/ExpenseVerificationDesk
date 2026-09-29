@@ -1,11 +1,15 @@
 """Audit trail logging for the pipeline."""
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from .schemas import RunResult
+
+
+class AuditWriteError(RuntimeError):
+    """A mandatory audit write failed. Finalization and downstream loads must stop."""
 
 
 def create_audit_file(audit_dir: str, run_id: str) -> Path:
@@ -18,7 +22,7 @@ def create_audit_file(audit_dir: str, run_id: str) -> Path:
 def log_stage_completion(audit_file: Path, stage: str, status: str, detail: Optional[dict] = None) -> None:
     """Log completion of a pipeline stage."""
     entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "event": "stage_completion",
         "stage": stage,
         "status": status,
@@ -30,7 +34,7 @@ def log_stage_completion(audit_file: Path, stage: str, status: str, detail: Opti
 def log_gate_check(audit_file: Path, stage: str, passed: bool, detail: Optional[dict] = None) -> None:
     """Log a gate check result."""
     entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "event": "gate_check",
         "stage": stage,
         "passed": passed,
@@ -46,16 +50,20 @@ def log_decision(
     reasoning_path: Optional[list[str]] = None,
     policy_matched: Optional[str] = None,
     confidence: Optional[float] = None,
+    rule_citations: Optional[list[str]] = None,
+    reconciliation_rule: Optional[str] = None,
 ) -> None:
     """Log one approve/flag/escalate decision. Lineage shape: governance-logger/docs/decision-lineage-schema.md."""
     entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "event": "decision",
         "report_id": report_id,
         "outcome": outcome,
         "reasoning_path": reasoning_path,
         "policy_matched": policy_matched,
         "confidence": confidence,
+        "rule_citations": rule_citations or [],
+        "reconciliation_rule": reconciliation_rule,
     }
     _append_to_audit(audit_file, entry)
 
@@ -63,7 +71,7 @@ def log_decision(
 def log_disagreement(audit_file: Path, report_id: str, checker_verdict: str, verifier_verdict: str) -> None:
     """Log a disagreement between checker and verifier."""
     entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "event": "verdict_disagreement",
         "report_id": report_id,
         "checker_verdict": checker_verdict,
@@ -75,7 +83,7 @@ def log_disagreement(audit_file: Path, report_id: str, checker_verdict: str, ver
 def log_snowflake_load(audit_file: Path, row_count: int, verified_count: int, success: bool) -> None:
     """Log Snowflake load result."""
     entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "event": "snowflake_load",
         "rows_inserted": row_count,
         "verified_count": verified_count,
@@ -87,7 +95,7 @@ def log_snowflake_load(audit_file: Path, row_count: int, verified_count: int, su
 def log_run_summary(audit_file: Path, run_result: RunResult) -> None:
     """Log final run summary."""
     entry = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "event": "run_complete",
         "run_id": run_result.run_id,
         "total_expenses": len(run_result.expenses),
@@ -100,17 +108,17 @@ def log_run_summary(audit_file: Path, run_result: RunResult) -> None:
 
 
 def _append_to_audit(audit_file: Path, entry: dict) -> None:
-    """Append an entry to the audit JSON file."""
+    """Append an entry to the audit JSON file. Failure blocks the caller."""
     try:
         if audit_file.exists():
-            with open(audit_file, "r") as f:
-                audit_log = json.load(f)
+            with open(audit_file, "r", encoding="utf-8") as handle:
+                audit_log = json.load(handle)
         else:
             audit_log = []
 
         audit_log.append(entry)
 
-        with open(audit_file, "w") as f:
-            json.dump(audit_log, f, indent=2, default=str)
-    except Exception as e:
-        print(f"Warning: Failed to log to audit file: {e}")
+        with open(audit_file, "w", encoding="utf-8") as handle:
+            json.dump(audit_log, handle, indent=2, default=str)
+    except Exception as exc:
+        raise AuditWriteError(f"Failed to log to audit file: {exc}") from exc

@@ -38,7 +38,7 @@ def ingest_expenses(spreadsheet_path: str) -> ExpenseSheet:
         raise ValueError(f"Missing required columns: {missing}")
 
     expenses = []
-    for _, row in df.iterrows():
+    for excel_index, (_, row) in enumerate(df.iterrows()):
         try:
             expense = Expense(
                 report_id=str(row["report_id"]).strip(),
@@ -50,6 +50,7 @@ def ingest_expenses(spreadsheet_path: str) -> ExpenseSheet:
                 currency=str(row["currency"]).strip(),
                 receipt_attached=bool(row["receipt_attached"]),
                 notes=str(row.get("notes", "")).strip() or None,
+                source_row=excel_index + 2,
             )
             expenses.append(expense)
         except Exception as e:
