@@ -13,7 +13,7 @@ scope:
     - AGENTS.md
     - pyproject.toml
   fixture_paths:
-    - sample_expenses.xlsx
+    - sample_data/sample_expenses.xlsx
     - sample_policy_manual.docx
   notes:
     - Fixture spreadsheets/documents are retained because tests and examples need non-secret sample inputs.
@@ -62,11 +62,24 @@ audit_path: audit/multi_repo/2026-09-18/repo_expenseverificationpipeline_2026091
 risk_level: HIGH
 human_review_required: true
 audit_findings:
-  - "Spreadsheet/data export files found: sample_expenses.xlsx"
+  - "Spreadsheet/data export files found: sample_data/sample_expenses.xlsx"
   - "External AI API usage: anthropic — API key management required."
   - "Credential pattern indicators in code: api_key"
   - "Risk level is HIGH, expected LOW."
   - "Dependency manifests present: pyproject.toml"
   - "Test suite present — actively developed project."
   - "Missing AGENTS.md — no machine-readable safety policy."
+
+## Approval gates
+
+Human approval is required before dependency changes, external-call changes, deploy or container config, secrets, and AI-provider or database config.
+
+## Setup
+
+pip install -e ".[dev]"
+python -m pytest -q
+
+## Sample data
+
+`sample_data/sample_expenses.xlsx` is the synthetic expense fixture (7 repeated employees, 4 departments, 40 rows).
 

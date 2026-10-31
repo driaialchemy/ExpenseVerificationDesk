@@ -1,0 +1,5 @@
+---
+description: Governance safety constraints for agents
+alwaysApply: true
+---
+Follow AGENTS.md. Do not print or commit secrets. Do not rewrite git history. Do not delete user data. Stop after two failed test runs.

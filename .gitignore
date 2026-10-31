@@ -59,3 +59,10 @@ reports/
 *.xlsx
 *.xls
 *.csv
+
+# governance baseline ignores
+!.env.example
+node_modules/
+*.log
+audit_temp/
+generated/
