@@ -51,7 +51,7 @@ def main():
         st.caption("Showing local reports (Snowflake is not configured).")
 
     if not run_ids:
-        st.warning("No runs found. Run `expense-verify run sample_expenses.xlsx sample_policy_manual.docx` first.")
+        st.warning("No runs found. Run `expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx` first.")
         return
 
     # Run selector

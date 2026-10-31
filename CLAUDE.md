@@ -52,7 +52,7 @@ If uncertain, ask the user before proceeding.
 
 - Audit path: $AuditFile
 - Risk level from audit: $risk.
-- Addressed audit issues: Spreadsheet/data export files found: sample_expenses.xlsx; External AI API usage: anthropic — API key management required.; Credential pattern indicators in code: api_key; Risk level is HIGH, expected LOW.; Dependency manifests present: pyproject.toml; Test suite present — actively developed project.; Missing AGENTS.md — no machine-readable safety policy.
+- Addressed audit issues: Spreadsheet/data export files found: sample_data/sample_expenses.xlsx; External AI API usage: anthropic — API key management required.; Credential pattern indicators in code: api_key; Risk level is HIGH, expected LOW.; Dependency manifests present: pyproject.toml; Test suite present — actively developed project.; Missing AGENTS.md — no machine-readable safety policy.
 
 
 ## AI Provider Boundary
@@ -62,7 +62,7 @@ AI providers detected by audit: anthropic. Use providers only for the repository
 
 ## Data Export Boundary
 
-Spreadsheet/data export files detected by audit: sample_expenses.xlsx. Keep generated exports gitignored unless they are documented fixtures. Do not replace synthetic/sample fixtures with real operational data.
+Spreadsheet/data export files detected by audit: sample_data/sample_expenses.xlsx. Keep generated exports gitignored unless they are documented fixtures. Do not replace synthetic/sample fixtures with real operational data.
 
 
 ## Human Review Required

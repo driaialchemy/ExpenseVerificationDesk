@@ -41,7 +41,7 @@
 - `sql/001_create_tables.sql` — Snowflake schema DDL
 
 #### Sample Data
-- `sample_expenses.xlsx` — Test expense data (40 rows)
+- `sample_data/sample_expenses.xlsx` — Test expense data (40 rows)
 - `sample_policy_manual.docx` — Test policy document (6 categories)
 
 ### Repository Statistics
@@ -75,7 +75,7 @@ Commits:            3 (initial build + README update + merge)
 
 4. **Run**
    ```bash
-   expense-verify run sample_expenses.xlsx sample_policy_manual.docx
+   expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx
    ```
 
 5. **Dashboard**
@@ -107,7 +107,7 @@ Commits:            3 (initial build + README update + merge)
    - Streamlit-in-Snowflake (native integration)
 
 3. **Connect Data** — Point to your own expense files:
-   - Replace `sample_expenses.xlsx` with your expense data
+   - Replace `sample_data/sample_expenses.xlsx` with your expense data
    - Replace `sample_policy_manual.docx` with your policy
 
 4. **Monitor** — Check audit trails in `audit/` directory:

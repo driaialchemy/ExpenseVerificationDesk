@@ -96,7 +96,7 @@ expense-verification-pipeline/
 ### Real Data Tested
 
 ✓ **Pipeline successfully ran against sample data:**
-- Loaded 40 expenses from sample_expenses.xlsx
+- Loaded 40 expenses from sample_data/sample_expenses.xlsx
 - Parsed 6 policy categories from sample_policy_manual.docx
 - Successfully completed Stages 1-2
 
@@ -113,13 +113,13 @@ pip install -e ".[dev]"
 pytest tests/
 
 # Run pipeline (stages 1-5 only)
-expense-verify run sample_expenses.xlsx sample_policy_manual.docx
+expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx
 
 # Run with Snowflake (requires credentials)
 export ANTHROPIC_API_KEY=sk-...
 export SNOWFLAKE_ACCOUNT=xy12345.us-east-1
 # ... set other env vars from .env.example
-expense-verify run sample_expenses.xlsx sample_policy_manual.docx --load-to-snowflake
+expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx --load-to-snowflake
 
 # Start dashboard
 streamlit run src/expense_pipeline/dashboard/app.py

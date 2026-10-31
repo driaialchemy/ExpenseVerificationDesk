@@ -36,7 +36,7 @@ All 31 tests pass with 100% success rate.
 
 ```bash
 # Without Snowflake (local reports only)
-expense-verify run sample_expenses.xlsx sample_policy_manual.docx
+expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx
 
 # With Snowflake load (requires credentials)
 export ANTHROPIC_API_KEY=sk-...
@@ -48,7 +48,7 @@ export SNOWFLAKE_DATABASE=your_db
 export SNOWFLAKE_SCHEMA=your_schema
 export SNOWFLAKE_ROLE=your_role
 
-expense-verify run sample_expenses.xlsx sample_policy_manual.docx --load-to-snowflake
+expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx --load-to-snowflake
 ```
 
 ### View Dashboard
@@ -189,7 +189,7 @@ expenseverificationpipeline/
 │   └── policy_rules.yaml             # Parsed policy rules
 ├── audit/                            # Audit JSON output (gitignored)
 ├── reports/                          # CSV reports (gitignored)
-├── sample_expenses.xlsx              # Test data
+├── sample_data/sample_expenses.xlsx              # Test data
 ├── sample_policy_manual.docx         # Test data
 ├── pyproject.toml                    # Package config
 ├── .gitignore
@@ -203,7 +203,7 @@ expenseverificationpipeline/
 ### Basic Pipeline Run
 
 ```bash
-expense-verify run sample_expenses.xlsx sample_policy_manual.docx
+expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx
 ```
 
 Output:
@@ -232,7 +232,7 @@ Writing reports...
 ### With Snowflake
 
 ```bash
-expense-verify run sample_expenses.xlsx sample_policy_manual.docx --load-to-snowflake
+expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx --load-to-snowflake
 ```
 
 Stage 6 loads to Snowflake and independently verifies the row count before marking success.
@@ -388,7 +388,7 @@ The Anthropic API key is missing. Either:
 The Anthropic SDK hides the real TLS/network failure. The pipeline now retries over IPv4 and prints the underlying error. If `api.anthropic.com` is blocked (firewall, proxy, or SSL inspection), finish the run with the independent verifier:
 
 ```bash
-expense-verify run sample_expenses.xlsx sample_policy_manual.docx --skip-checker
+expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx --skip-checker
 ```
 
 For a corporate proxy:
@@ -405,10 +405,10 @@ The API key is valid, but the model ID is retired or not enabled for that key. T
 ```bash
 # PowerShell
 $env:ANTHROPIC_MODEL="claude-sonnet-5"
-expense-verify run sample_expenses.xlsx sample_policy_manual.docx
+expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx
 
 # or pass it on the command line
-expense-verify run sample_expenses.xlsx sample_policy_manual.docx --model claude-haiku-4-5
+expense-verify run sample_data/sample_expenses.xlsx sample_policy_manual.docx --model claude-haiku-4-5
 ```
 
 Current IDs: `claude-sonnet-5`, `claude-haiku-4-5`, `claude-opus-5`. Do not use `claude-3-5-sonnet-20241022` or `claude-opus-4-1`.
